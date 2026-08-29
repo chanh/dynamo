@@ -439,6 +439,11 @@ mod tests {
         let endpoint = endpoint();
         let sources: HashMap<_, _> = statuses.into_iter().collect();
         KvSourceMembershipView {
+            cache_evidence_barrier_enabled: HashMap::new(),
+            serving_incarnations: HashMap::new(),
+            cache_evidence_serving_incarnations: HashMap::new(),
+            cache_evidence_epoch_enabled: HashMap::new(),
+            cache_evidence_epoch_media: HashMap::new(),
             serving_endpoint: endpoint.clone(),
             endpoint_resolution: KvStateEndpointResolution::Resolved(endpoint),
             recovery_expected: HashMap::new(),
@@ -463,6 +468,7 @@ mod tests {
                 kv_state_endpoint: endpoint(),
                 worker,
                 publisher_id: 11,
+                evidence_incarnation_id: None,
                 recovery_target: None,
             }),
         )

@@ -179,6 +179,82 @@ pub struct RequestTracker {
     /// re-tokenizing. Lives here rather than on `routing_data` because the preprocessor
     /// drains `routing_data` before the delta generator runs. First-write-wins.
     external_query_token_ids: OnceLock<Vec<u32>>,
+
+    /// Worker-reported source of every prompt token. First-write-wins because
+    /// the worker attaches it to exactly one response chunk.
+    cache_source_observation: OnceLock<CacheSourceObservation>,
+}
+
+/// Worker-observed prompt-token sources after vLLM finishes cache lookup.
+///
+/// Counts are optional so missing telemetry remains explicit. A complete
+/// observation is valid only when all counts are present and conserve the
+/// prompt-token total.
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CacheGroupObservation {
+    pub group_idx: u32,
+    pub kind: String,
+    pub block_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<u32>,
+    #[serde(default)]
+    pub is_eagle: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment_tokens: Option<u32>,
+}
+
+#[derive(ToSchema, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CacheSourceObservation {
+    pub schema_version: u8,
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_hit_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_hit_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_lookup_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_failure_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recomputed_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_groups: Option<Vec<CacheGroupObservation>>,
+}
+
+impl CacheSourceObservation {
+    pub fn validate(mut self) -> Self {
+        let source_counts_valid = self
+            .gpu_hit_tokens
+            .zip(self.cpu_hit_tokens)
+            .zip(self.recomputed_tokens)
+            .zip(self.prompt_tokens)
+            .is_some_and(|(((gpu, cpu), recomputed), prompt)| {
+                gpu.checked_add(cpu)
+                    .and_then(|sum| sum.checked_add(recomputed))
+                    == Some(prompt)
+            });
+        let retrieval_counts_valid = self
+            .cpu_lookup_tokens
+            .zip(self.cpu_hit_tokens)
+            .zip(self.retrieval_failure_tokens)
+            .zip(self.recomputed_tokens)
+            .is_some_and(|(((lookup, hit), failure), recomputed)| {
+                lookup >= hit && failure == lookup - hit && failure <= recomputed
+            });
+        let valid = self.schema_version == 1
+            && self.complete
+            && source_counts_valid
+            && retrieval_counts_valid;
+        if self.complete && !valid {
+            self.complete = false;
+            self.incomplete_reason = Some("invalid_cache_source_observation".to_string());
+        }
+        self
+    }
 }
 
 /// Data a standalone router (running the `PushRouter` bindings in its own process)
@@ -200,6 +276,11 @@ pub struct RoutingData {
     /// reused without re-tokenizing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<u32>>,
+
+    /// Worker cache lookup result, forwarded internally and drained before the
+    /// client response is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_source_observation: Option<CacheSourceObservation>,
 }
 
 impl RequestTracker {
@@ -238,6 +319,7 @@ impl RequestTracker {
             prefill_complete_time: OnceLock::new(),
             external_timing: OnceLock::new(),
             external_query_token_ids: OnceLock::new(),
+            cache_source_observation: OnceLock::new(),
         }
     }
 
@@ -650,6 +732,17 @@ impl RequestTracker {
         if let Some(rank) = info.decode_dp_rank {
             Self::record_once_u32(&self.decode_dp_rank, rank, "decode_dp_rank");
         }
+    }
+
+    /// Record and validate the worker's prompt-token source observation.
+    pub fn record_cache_source_observation(&self, observation: CacheSourceObservation) -> bool {
+        self.cache_source_observation
+            .set(observation.validate())
+            .is_ok()
+    }
+
+    pub fn cache_source_observation(&self) -> Option<&CacheSourceObservation> {
+        self.cache_source_observation.get()
     }
 
     /// The query-only tokenized prompt forwarded from a standalone router, if any.
@@ -1174,6 +1267,62 @@ mod tests {
         assert!(
             json2.contains("kv_transfer_estimated_latency_ms"),
             "Set field should appear in JSON, got: {json2}"
+        );
+    }
+
+    #[test]
+    fn cache_source_observation_requires_token_conservation() {
+        let valid = CacheSourceObservation {
+            schema_version: 1,
+            complete: true,
+            prompt_tokens: Some(100),
+            gpu_hit_tokens: Some(30),
+            cpu_hit_tokens: Some(40),
+            cpu_lookup_tokens: Some(45),
+            retrieval_failure_tokens: Some(5),
+            recomputed_tokens: Some(30),
+            incomplete_reason: None,
+            cache_groups: None,
+        }
+        .validate();
+        assert!(valid.complete);
+
+        let invalid = CacheSourceObservation {
+            recomputed_tokens: Some(29),
+            ..valid
+        }
+        .validate();
+        assert!(!invalid.complete);
+        assert_eq!(
+            invalid.incomplete_reason.as_deref(),
+            Some("invalid_cache_source_observation")
+        );
+    }
+
+    #[test]
+    fn request_tracker_preserves_explicitly_incomplete_observation() {
+        let tracker = RequestTracker::new();
+        assert!(
+            tracker.record_cache_source_observation(CacheSourceObservation {
+                schema_version: 1,
+                complete: false,
+                prompt_tokens: Some(20),
+                gpu_hit_tokens: None,
+                cpu_hit_tokens: None,
+                cpu_lookup_tokens: None,
+                retrieval_failure_tokens: None,
+                recomputed_tokens: None,
+                incomplete_reason: Some("cache_source_breakdown_unavailable".to_string()),
+                cache_groups: None,
+            })
+        );
+
+        let observation = tracker.cache_source_observation().unwrap();
+        assert!(!observation.complete);
+        assert_eq!(observation.prompt_tokens, Some(20));
+        assert_eq!(
+            observation.incomplete_reason.as_deref(),
+            Some("cache_source_breakdown_unavailable")
         );
     }
 }

@@ -291,7 +291,11 @@ async fn zmq_multipart_parsing() {
         // 4-frame (bad).
         let good_payload = TestBatch(
             0.0,
-            vec![RawKvEvent::AllBlocksCleared { ownership: None }],
+            vec![RawKvEvent::AllBlocksCleared {
+                medium: None,
+                ownership: None,
+                epoch_id: None,
+            }],
             None,
         )
         .encode();

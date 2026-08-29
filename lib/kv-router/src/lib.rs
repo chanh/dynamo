@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 mod active_set;
+pub mod cache_loss;
 pub(crate) mod cleanup;
 pub mod conditional_disagg;
 mod lookup_update;

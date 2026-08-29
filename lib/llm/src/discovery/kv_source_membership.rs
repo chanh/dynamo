@@ -41,6 +41,10 @@ pub struct KvEventSource {
     pub kv_state_endpoint: EndpointId,
     pub worker: WorkerWithDpRank,
     pub publisher_id: PublisherId,
+    /// Identifies the ordered cache-evidence stream for this source lifecycle.
+    /// Absent on N-2 publishers that predate freshness-fenced evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_incarnation_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_target: Option<Instance>,
 }
@@ -149,6 +153,16 @@ pub struct KvSourceMembershipView<S = KvEventSource> {
     /// Whether the serving runtime config expects a worker-local recovery target.
     /// This is expectation/readiness metadata only and never admits a serving worker.
     pub recovery_expected: HashMap<WorkerWithDpRank, bool>,
+    /// Explicit route-time cache-evidence barrier capability. Missing is a
+    /// legacy worker and cannot participate in exact evidence.
+    pub cache_evidence_barrier_enabled: HashMap<WorkerId, Option<bool>>,
+    /// Frontend-local lifecycle of each serving registration. This is carried
+    /// independently from the KV publisher incarnation so a restarted worker
+    /// cannot be selected against its predecessor's evidence stream.
+    pub serving_incarnations: HashMap<WorkerId, Option<u64>>,
+    pub cache_evidence_serving_incarnations: HashMap<WorkerWithDpRank, Option<u64>>,
+    pub cache_evidence_epoch_enabled: HashMap<WorkerId, Option<bool>>,
+    pub cache_evidence_epoch_media: HashMap<WorkerWithDpRank, Option<HashSet<String>>>,
 }
 
 impl<S> KvSourceMembershipView<S> {
@@ -171,6 +185,13 @@ impl<S> KvSourceMembershipView<S> {
         self.kv_event_source_mode
             .get(&worker_id)
             .and_then(Option::as_deref)
+    }
+
+    pub fn cache_evidence_barrier_enabled(&self, worker_id: WorkerId) -> Option<bool> {
+        self.cache_evidence_barrier_enabled
+            .get(&worker_id)
+            .copied()
+            .flatten()
     }
 
     pub fn resolved_kv_state_endpoint(&self) -> Option<&EndpointId> {
@@ -408,6 +429,53 @@ where
             .iter()
             .map(|(&worker_id, config)| (worker_id, config.kv_event_source_mode.clone()))
             .collect();
+        let cache_evidence_barrier_enabled = runtime_configs
+            .iter()
+            .map(|(&worker_id, config)| {
+                (
+                    worker_id,
+                    config
+                        .runtime_data
+                        .get("cache_evidence_barrier_v1")
+                        .and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect();
+        let serving_incarnations = runtime_configs
+            .iter()
+            .map(|(&worker_id, config)| (worker_id, config.discovery_incarnation()))
+            .collect();
+        let cache_evidence_serving_incarnations = expected_workers(runtime_configs)
+            .map(|(worker, _)| {
+                let config = runtime_configs
+                    .get(&worker.worker_id)
+                    .expect("expected worker has runtime config");
+                (
+                    worker,
+                    config.cache_evidence_serving_incarnation(worker.dp_rank),
+                )
+            })
+            .collect();
+        let cache_evidence_epoch_enabled = runtime_configs
+            .iter()
+            .map(|(&worker_id, config)| {
+                (
+                    worker_id,
+                    config
+                        .runtime_data
+                        .get("cache_evidence_epoch_v1")
+                        .and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect();
+        let cache_evidence_epoch_media = expected_workers(runtime_configs)
+            .map(|(worker, _)| {
+                let media = runtime_configs
+                    .get(&worker.worker_id)
+                    .and_then(|config| config.cache_evidence_epoch_media(worker.dp_rank));
+                (worker, media)
+            })
+            .collect();
 
         KvSourceMembershipView {
             serving_endpoint: serving_endpoint.clone(),
@@ -415,6 +483,11 @@ where
             recovery_expected: workers,
             kv_event_publishing_enabled,
             kv_event_source_mode,
+            cache_evidence_barrier_enabled,
+            serving_incarnations,
+            cache_evidence_serving_incarnations,
+            cache_evidence_epoch_enabled,
+            cache_evidence_epoch_media,
             sources,
         }
     }
@@ -505,6 +578,7 @@ mod tests {
             kv_state_endpoint: endpoint.clone(),
             worker: WorkerWithDpRank::new(worker_id, rank),
             publisher_id,
+            evidence_incarnation_id: None,
             recovery_target: None,
         }
     }
@@ -516,6 +590,7 @@ mod tests {
         publisher_id: u64,
     ) -> KvEventSource {
         KvEventSource {
+            evidence_incarnation_id: None,
             recovery_target: Some(Instance {
                 component: "query".to_string(),
                 endpoint: "rank".to_string(),
@@ -681,5 +756,59 @@ mod tests {
 
         assert_eq!(view.kv_event_publishing_enabled, HashMap::from([(7, None)]));
         assert_eq!(view.kv_event_publishing_enabled(7), None);
+    }
+
+    #[test]
+    fn view_binds_distinct_engine_incarnations_for_same_worker_dp_ranks() {
+        let serving = endpoint("generate");
+        let configs = HashMap::from([(
+            7,
+            ModelRuntimeConfig {
+                data_parallel_start_rank: 4,
+                data_parallel_size: 2,
+                runtime_data: HashMap::from([(
+                    "cache_evidence_serving_incarnations".to_string(),
+                    serde_json::json!({"4": "18446744073709551615", "5": 202}),
+                )]),
+                ..Default::default()
+            },
+        )]);
+
+        let view = KvSourceMembership::<KvEventSource>::new().view(&serving, &configs);
+
+        assert_eq!(
+            view.cache_evidence_serving_incarnations,
+            HashMap::from([
+                (WorkerWithDpRank::new(7, 4), Some(u64::MAX)),
+                (WorkerWithDpRank::new(7, 5), Some(202)),
+            ])
+        );
+    }
+
+    #[test]
+    fn view_rejects_unsafe_numeric_cache_evidence_incarnations() {
+        let serving = endpoint("generate");
+        let configs = HashMap::from([(
+            7,
+            ModelRuntimeConfig {
+                data_parallel_start_rank: 4,
+                data_parallel_size: 2,
+                runtime_data: HashMap::from([(
+                    "cache_evidence_serving_incarnations".to_string(),
+                    serde_json::json!({"4": 9_007_199_254_740_992_u64, "5": 202.0}),
+                )]),
+                ..Default::default()
+            },
+        )]);
+
+        let view = KvSourceMembership::<KvEventSource>::new().view(&serving, &configs);
+
+        assert_eq!(
+            view.cache_evidence_serving_incarnations,
+            HashMap::from([
+                (WorkerWithDpRank::new(7, 4), None),
+                (WorkerWithDpRank::new(7, 5), None),
+            ])
+        );
     }
 }

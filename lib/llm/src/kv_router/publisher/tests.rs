@@ -556,7 +556,11 @@ mod test_event_processing {
     #[test]
     fn test_convert_event_all_blocks_cleared() {
         let kv_block_size = 4;
-        let raw_evt = RawKvEvent::AllBlocksCleared { ownership: None };
+        let raw_evt = RawKvEvent::AllBlocksCleared {
+            medium: None,
+            ownership: None,
+            epoch_id: None,
+        };
         let out = convert_event(
             raw_evt,
             1,
@@ -1274,7 +1278,10 @@ mod tests_startup_helpers {
                 endpoint.to_string(),
                 topic,
                 1,
+                0,
+                1,
                 tx,
+                None,
                 token,
                 4,
                 next_event_id,
@@ -1404,7 +1411,10 @@ mod tests_startup_helpers {
                 endpoint,
                 String::new(),
                 1,
+                0,
+                1,
                 tx,
+                None,
                 token,
                 4,
                 Arc::new(AtomicU64::new(0)),
@@ -1502,7 +1512,10 @@ mod tests_startup_helpers {
                 endpoint,
                 String::new(),
                 1,
+                0,
+                1,
                 tx,
+                None,
                 token,
                 4,
                 Arc::new(AtomicU64::new(0)),
@@ -1589,7 +1602,19 @@ mod tests_startup_helpers {
         let listener_handle = tokio::spawn({
             let token = token.clone();
             let endpoint = endpoint.clone();
-            start_zmq_listener(endpoint, topic, 1, tx, token, 4, next_event_id, None)
+            start_zmq_listener(
+                endpoint,
+                topic,
+                1,
+                0,
+                1,
+                tx,
+                None,
+                token,
+                4,
+                next_event_id,
+                None,
+            )
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
@@ -1613,6 +1638,8 @@ mod tests_startup_helpers {
                 ownership: None,
             }],
             data_parallel_rank: Some(0),
+            barrier_id: None,
+            epoch_id: None,
         };
         let payload = rmps::to_vec(&batch).unwrap();
 
@@ -1643,6 +1670,40 @@ mod tests_startup_helpers {
             panic!("expected KvCacheStoreData");
         };
         assert_eq!(blocks[0].block_hash.0, 64);
+
+        token.cancel();
+        let _ = listener_handle.await;
+    }
+
+    #[tokio::test]
+    async fn idle_zmq_listener_emits_ordered_evidence_heartbeat() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
+        let (evidence_tx, mut evidence_rx) = mpsc::unbounded_channel();
+        let (_ipc_dir, endpoint) = unique_ipc_endpoint();
+        let token = CancellationToken::new();
+        let listener_handle = tokio::spawn(start_zmq_listener(
+            endpoint,
+            String::new(),
+            7,
+            3,
+            41,
+            tx,
+            Some(evidence_tx),
+            token.clone(),
+            4,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        ));
+
+        let heartbeat = tokio::time::timeout(Duration::from_secs(2), evidence_rx.recv())
+            .await
+            .expect("idle heartbeat timeout")
+            .expect("evidence channel closed");
+        assert!(heartbeat.heartbeat);
+        assert_eq!(heartbeat.owner.worker_id, 7);
+        assert_eq!(heartbeat.owner.dp_rank, 3);
+        assert_eq!(heartbeat.source_incarnation_id, Some(41));
+        assert_eq!(heartbeat.watermark_source_cursor, None);
 
         token.cancel();
         let _ = listener_handle.await;

@@ -60,6 +60,8 @@ struct QueuedRequest {
 
 struct SelectedWorkerForRequest {
     selection: WorkerSelectionResult,
+    discovery_incarnation: Option<u64>,
+    cache_evidence_incarnation: Option<u64>,
     selected_worker_tiers: SelectedWorkerTierSnapshot,
     selected_worker_load: AdvisoryWorkerLoad,
     non_max_overlap_selection: Option<NonMaxOverlapSelection>,
@@ -1056,8 +1058,12 @@ impl<
                             as usize,
                         total_kv_blocks: config.total_kv_blocks().map(|blocks| blocks as usize),
                     };
+                    let cache_evidence_incarnation =
+                        config.cache_evidence_serving_incarnation(selection.worker.dp_rank);
                     SelectedWorkerForRequest {
                         selection,
+                        discovery_incarnation: config.discovery_incarnation(),
+                        cache_evidence_incarnation,
                         selected_worker_tiers,
                         selected_worker_load,
                         non_max_overlap_selection,
@@ -1079,6 +1085,8 @@ impl<
             selected_worker_load: selected.selected_worker_load,
             response: SchedulingResponse {
                 best_worker: selected.selection.worker,
+                selected_discovery_incarnation: selected.discovery_incarnation,
+                selected_cache_evidence_incarnation: selected.cache_evidence_incarnation,
                 effective_overlap_blocks: selected.selection.effective_overlap_blocks,
                 cached_tokens: selected.selection.cached_tokens,
                 selected_worker_tiers: selected.selected_worker_tiers,
@@ -1105,6 +1113,8 @@ impl<
             target_cached_prefix_blocks(&request, selected.selection.worker);
         let response = SchedulingResponse {
             best_worker: selected.selection.worker,
+            selected_discovery_incarnation: selected.discovery_incarnation,
+            selected_cache_evidence_incarnation: selected.cache_evidence_incarnation,
             effective_overlap_blocks: selected.selection.effective_overlap_blocks,
             cached_tokens: selected.selection.cached_tokens,
             selected_worker_tiers: selected.selected_worker_tiers,

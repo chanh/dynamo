@@ -348,7 +348,11 @@ async fn clear_all_propagates() {
         // Send ClearAll.
         let clear = TestBatch(
             2.0,
-            vec![RawKvEvent::AllBlocksCleared { ownership: None }],
+            vec![RawKvEvent::AllBlocksCleared {
+                medium: None,
+                ownership: None,
+                epoch_id: None,
+            }],
             None,
         );
         pub_handle.send_batch(&clear).await.expect("send clear");

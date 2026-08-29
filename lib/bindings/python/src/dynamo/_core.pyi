@@ -141,12 +141,19 @@ class DistributedRuntime:
         ...
 
 
+class PromptSourcePublisher:
+    def publish(self, outcome: Dict[str, Any]) -> bool: ...
+    def observe_control_result(self, result: str) -> None: ...
+
+
 class Endpoint:
     """
     An Endpoint is a single API endpoint
     """
 
     ...
+
+    async def prompt_source_publisher(self) -> PromptSourcePublisher: ...
 
     async def serve_endpoint(self, handler: RequestHandler, graceful_shutdown: bool = True, metrics_labels: Optional[List[Tuple[str, str]]] = None, health_check_payload: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -161,7 +168,6 @@ class Endpoint:
                                   that will be used to verify endpoint health
         """
         ...
-
     async def serve_bidirectional_endpoint(
         self,
         handler: Callable[..., AsyncIterator[JsonLike]],

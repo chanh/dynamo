@@ -381,6 +381,53 @@ impl Default for ModelRuntimeConfig {
 }
 
 impl ModelRuntimeConfig {
+    // Kubernetes metadata may pass JSON numbers through double precision.
+    const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
+
+    pub(crate) fn cache_evidence_serving_incarnation(&self, dp_rank: u32) -> Option<u64> {
+        self.runtime_data
+            .get("cache_evidence_serving_incarnations")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|incarnations| incarnations.get(&dp_rank.to_string()))
+            .and_then(|value| match value {
+                serde_json::Value::String(value)
+                    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    value.parse().ok()
+                }
+                serde_json::Value::Number(value) => value
+                    .as_u64()
+                    .filter(|value| *value <= Self::MAX_SAFE_JSON_INTEGER),
+                _ => None,
+            })
+            .filter(|value| *value > 0)
+    }
+
+    pub(crate) fn cache_evidence_epoch_media(&self, dp_rank: u32) -> Option<HashSet<String>> {
+        let media: HashSet<_> = self
+            .runtime_data
+            .get("cache_evidence_epoch_media")?
+            .as_object()?
+            .get(&dp_rank.to_string())?
+            .as_array()?
+            .iter()
+            .map(serde_json::Value::as_str)
+            .collect::<Option<_>>()?;
+        let media: HashSet<String> = media.into_iter().map(str::to_string).collect();
+        let gpu = HashSet::from(["GPU".to_string()]);
+        let gpu_cpu = HashSet::from(["GPU".to_string(), "CPU".to_string()]);
+        (media == gpu || media == gpu_cpu).then_some(media)
+    }
+
+    pub(crate) const DISCOVERY_INCARNATION_RUNTIME_KEY: &'static str =
+        "_dynamo_discovery_incarnation";
+
+    pub(crate) fn discovery_incarnation(&self) -> Option<u64> {
+        self.runtime_data
+            .get(Self::DISCOVERY_INCARNATION_RUNTIME_KEY)
+            .and_then(serde_json::Value::as_u64)
+    }
+
     fn router_hints_enabled(&self) -> bool {
         match self.runtime_data.get(ROUTER_HINT_RUNTIME_CAPABILITY_KEY) {
             Some(serde_json::Value::Bool(true)) => true,
@@ -418,6 +465,14 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
 
     fn total_kv_blocks(&self) -> Option<u64> {
         self.total_kv_blocks
+    }
+
+    fn discovery_incarnation(&self) -> Option<u64> {
+        self.discovery_incarnation()
+    }
+
+    fn cache_evidence_serving_incarnation(&self, dp_rank: u32) -> Option<u64> {
+        self.cache_evidence_serving_incarnation(dp_rank)
     }
 
     fn router_hint_metadata_for_dp_rank(

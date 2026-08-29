@@ -1749,6 +1749,7 @@ mod tests {
             kv_state_endpoint: endpoint.clone(),
             worker,
             publisher_id: publisher.publisher_id(),
+            evidence_incarnation_id: None,
             recovery_target: None,
         };
         component

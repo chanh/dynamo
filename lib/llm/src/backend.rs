@@ -44,8 +44,38 @@ use crate::protocols::{
         },
         preprocessor::PreprocessedEmbeddingRequest,
         timing::RequestTracker,
+        timing::{CacheSourceObservation, RoutingData},
     },
 };
+
+const CACHE_SOURCE_OBSERVATION_KEY: &str = "dynamo_cache_source_observation";
+
+pub(crate) fn take_cache_source_observation(
+    extra_args: &mut Option<serde_json::Value>,
+) -> Option<CacheSourceObservation> {
+    let value = extra_args
+        .as_mut()?
+        .as_object_mut()?
+        .remove(CACHE_SOURCE_OBSERVATION_KEY)?;
+    match serde_json::from_value::<CacheSourceObservation>(value) {
+        Ok(observation) => Some(observation.validate()),
+        Err(error) => {
+            tracing::warn!(%error, "Invalid worker cache-source observation");
+            Some(CacheSourceObservation {
+                schema_version: 0,
+                complete: false,
+                prompt_tokens: None,
+                gpu_hit_tokens: None,
+                cpu_hit_tokens: None,
+                cpu_lookup_tokens: None,
+                retrieval_failure_tokens: None,
+                recomputed_tokens: None,
+                incomplete_reason: Some("invalid_cache_source_payload".to_string()),
+                cache_groups: None,
+            })
+        }
+    }
+}
 use crate::tokenizers::{DecodeStream, Tokenizer};
 use dynamo_protocols::types::StopReason;
 
@@ -381,7 +411,14 @@ impl
         // convert stream of processed Annotated<LLMEngineOutput> to Annotated<BackendOutput>
         //let mdcsum = self.mdcsum.clone();
         let stream = processed_stream.map(move |output| {
-            output.map_data(|data| {
+            output.map_data(|mut data| {
+                let cache_source_observation = take_cache_source_observation(&mut data.extra_args);
+                let mut routing_data = data.routing_data;
+                if let Some(observation) = cache_source_observation {
+                    routing_data
+                        .get_or_insert_with(RoutingData::default)
+                        .cache_source_observation = Some(observation);
+                }
                 Ok(BackendOutput {
                     token_ids: data.token_ids,
                     tokens: data.tokens.unwrap_or_default(),
@@ -398,7 +435,7 @@ impl
                     encoder_result: data.encoder_result,
                     worker_trace_link: data.worker_trace_link,
                     engine_data: data.engine_data,
-                    routing_data: data.routing_data,
+                    routing_data,
                 })
             })
         });
@@ -833,5 +870,52 @@ mod tests {
             }
             other => panic!("Expected FinishReason::Error, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn cache_source_observation_is_drained_from_extra_args() {
+        let mut extra_args = Some(serde_json::json!({
+            "keep": "value",
+            CACHE_SOURCE_OBSERVATION_KEY: {
+                "schema_version": 1,
+                "complete": true,
+                "prompt_tokens": 10,
+                "gpu_hit_tokens": 2,
+                "cpu_hit_tokens": 3,
+                "cpu_lookup_tokens": 4,
+                "retrieval_failure_tokens": 1,
+                "recomputed_tokens": 5,
+                "cache_groups": [{
+                    "group_idx": 0,
+                    "kind": "mla_attention",
+                    "block_size": 256,
+                    "is_eagle": false,
+                    "alignment_tokens": 256
+                }]
+            }
+        }));
+
+        let observation = take_cache_source_observation(&mut extra_args).unwrap();
+        assert!(observation.complete);
+        assert_eq!(observation.cpu_hit_tokens, Some(3));
+        assert_eq!(
+            observation.cache_groups.as_ref().unwrap()[0].block_size,
+            256
+        );
+        assert_eq!(extra_args, Some(serde_json::json!({"keep": "value"})));
+    }
+
+    #[test]
+    fn malformed_cache_source_payload_becomes_incomplete() {
+        let mut extra_args = Some(serde_json::json!({
+            CACHE_SOURCE_OBSERVATION_KEY: {"unexpected": true}
+        }));
+
+        let observation = take_cache_source_observation(&mut extra_args).unwrap();
+        assert!(!observation.complete);
+        assert_eq!(
+            observation.incomplete_reason.as_deref(),
+            Some("invalid_cache_source_payload")
+        );
     }
 }

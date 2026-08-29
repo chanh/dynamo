@@ -14,6 +14,8 @@ pub struct KvEventBatch {
     pub events: Vec<RawKvEvent>,
     #[serde(alias = "dp_rank")]
     pub data_parallel_rank: Option<i32>,
+    pub barrier_id: Option<u64>,
+    pub epoch_id: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for KvEventBatch {
@@ -21,12 +23,39 @@ impl<'de> Deserialize<'de> for KvEventBatch {
     where
         D: serde::Deserializer<'de>,
     {
-        // Deserialize from array format: [timestamp, [events], data_parallel_rank]
-        let arr: (f64, Vec<RawKvEvent>, Option<i32>) = Deserialize::deserialize(deserializer)?;
+        // Compatibility with vLLM batches from the current and previous two releases.
+        // TODO: Remove the three-field arm after those releases leave the N-2 window.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireBatch {
+            Epoch(
+                (
+                    f64,
+                    Vec<RawKvEvent>,
+                    Option<i32>,
+                    Option<u64>,
+                    Option<String>,
+                ),
+            ),
+            Current((f64, Vec<RawKvEvent>, Option<i32>, Option<u64>)),
+            Legacy((f64, Vec<RawKvEvent>, Option<i32>)),
+        }
+        let (ts, events, data_parallel_rank, barrier_id, epoch_id) =
+            match WireBatch::deserialize(deserializer)? {
+                WireBatch::Epoch((ts, events, rank, barrier_id, epoch_id)) => {
+                    (ts, events, rank, barrier_id, epoch_id)
+                }
+                WireBatch::Current((ts, events, rank, barrier_id)) => {
+                    (ts, events, rank, barrier_id, None)
+                }
+                WireBatch::Legacy((ts, events, rank)) => (ts, events, rank, None, None),
+            };
         Ok(KvEventBatch {
-            ts: arr.0,
-            events: arr.1,
-            data_parallel_rank: arr.2,
+            ts,
+            events,
+            data_parallel_rank,
+            barrier_id,
+            epoch_id,
         })
     }
 }
@@ -144,7 +173,11 @@ pub enum RawKvEvent {
     },
     AllBlocksCleared {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        medium: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         ownership: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch_id: Option<String>,
     },
     Ignored,
 }
@@ -168,10 +201,10 @@ impl RawKvEvent {
     /// re-matching every variant.
     pub fn medium(&self) -> Option<&str> {
         match self {
-            Self::BlockStored { medium, .. } | Self::BlockRemoved { medium, .. } => {
-                medium.as_deref()
-            }
-            Self::AllBlocksCleared { .. } | Self::Ignored => None,
+            Self::BlockStored { medium, .. }
+            | Self::BlockRemoved { medium, .. }
+            | Self::AllBlocksCleared { medium, .. } => medium.as_deref(),
+            Self::Ignored => None,
         }
     }
 
@@ -188,11 +221,18 @@ impl RawKvEvent {
         KvEventOwnership::from_wire(self.ownership_wire())
     }
 
+    pub fn epoch_id(&self) -> Option<&str> {
+        match self {
+            Self::AllBlocksCleared { epoch_id, .. } => epoch_id.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn ownership_wire(&self) -> Option<&str> {
         match self {
             Self::BlockStored { ownership, .. }
             | Self::BlockRemoved { ownership, .. }
-            | Self::AllBlocksCleared { ownership } => ownership.as_deref(),
+            | Self::AllBlocksCleared { ownership, .. } => ownership.as_deref(),
             Self::Ignored => None,
         }
     }

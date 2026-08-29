@@ -14,6 +14,7 @@ pub use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
 
 use super::metrics::{ROUTER_QUEUE_METRICS, RouterQueueMetricHandles, RouterRequestMetrics};
+use super::prompt_source_outcome::TerminalPromptSourceRegistry;
 use super::sequence::{
     RuntimeSequencePublisher, SequenceError, SequenceRequest, create_multi_worker_sequences,
 };
@@ -41,6 +42,8 @@ where
     inner: Arc<LocalScheduler<RuntimeSequencePublisher, ModelRuntimeConfig, Sel, RF>>,
     queue_metrics: Vec<RouterQueueMetricHandles>,
     queue_metric_indices: HashMap<String, usize>,
+    prompt_source_registry: Option<TerminalPromptSourceRegistry>,
+    router_id: u64,
 }
 
 fn avoidable_prefill_tokens(overlap_blocks_lost: f64, block_size: u32) -> u64 {
@@ -75,6 +78,14 @@ where
             workers_with_configs.borrow().clone();
 
         let router_id = endpoint.drt().discovery().instance_id();
+        let prompt_source_registry =
+            match TerminalPromptSourceRegistry::for_endpoint(&endpoint, router_id).await {
+                Ok(registry) => Some(registry),
+                Err(error) => {
+                    tracing::warn!(%error, "terminal prompt-source subscriber unavailable");
+                    None
+                }
+            };
         let slots = create_multi_worker_sequences(
             endpoint,
             block_size as usize,
@@ -190,6 +201,8 @@ where
             inner,
             queue_metrics,
             queue_metric_indices,
+            prompt_source_registry,
+            router_id,
         })
     }
 
@@ -411,6 +424,14 @@ where
 
     pub fn worker_type(&self) -> &'static str {
         self.inner.worker_type()
+    }
+
+    pub fn prompt_source_registry(&self) -> Option<TerminalPromptSourceRegistry> {
+        self.prompt_source_registry.clone()
+    }
+
+    pub fn router_id(&self) -> u64 {
+        self.router_id
     }
 
     pub fn add_output_block(

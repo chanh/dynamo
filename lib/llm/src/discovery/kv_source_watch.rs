@@ -352,6 +352,7 @@ mod tests {
             kv_state_endpoint: endpoint.clone(),
             worker: WorkerWithDpRank::new(worker_id, 4),
             publisher_id,
+            evidence_incarnation_id: None,
             recovery_target: None,
         }
     }
@@ -362,6 +363,7 @@ mod tests {
         publisher_id: u64,
     ) -> KvEventSource {
         KvEventSource {
+            evidence_incarnation_id: None,
             recovery_target: Some(Instance {
                 namespace: "ns".to_string(),
                 component: "query".to_string(),

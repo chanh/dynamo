@@ -28,9 +28,12 @@ use crate::{
 
 pub(super) struct WorkerSelection {
     pub(super) worker: WorkerWithDpRank,
+    pub(super) _serving_incarnation: Option<u64>,
+    pub(super) cache_evidence_incarnation: Option<u64>,
     pub(super) overlap_amount: u32,
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
+    pub(super) cache_loss_router_visible_tokens: Option<u64>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) router_hint: Option<RouterHint>,
 }
@@ -113,17 +116,23 @@ where
         match outcome {
             FindBestMatchOutcome::Routed {
                 worker,
+                selected_discovery_incarnation,
+                selected_cache_evidence_incarnation,
                 overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
                 potential_decode_blocks: _,
+                cache_loss_router_visible_tokens,
                 routing_hashes,
                 router_hint,
             } => Ok(WorkerSelection {
                 worker,
+                _serving_incarnation: selected_discovery_incarnation,
+                cache_evidence_incarnation: selected_cache_evidence_incarnation,
                 overlap_amount: overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                cache_loss_router_visible_tokens,
                 routing_hashes,
                 router_hint,
             }),

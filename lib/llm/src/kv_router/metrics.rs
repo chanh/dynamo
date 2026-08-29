@@ -64,11 +64,312 @@ use prometheus::{
 
 use crate::http::service::metrics::generate_log_buckets;
 use crate::protocols::common::timing::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
+use dynamo_kv_router::cache_loss::CacheEvidenceStats;
+use dynamo_kv_router::cache_loss::CacheLossFunnel;
 
 pub(crate) const ROUTER_WORKER_ID_LABEL: &str = "router_worker_id";
 const TARGET_NAMESPACE_LABEL: &str = "target_namespace";
 const TARGET_COMPONENT_LABEL: &str = "target_component";
 const TARGET_ENDPOINT_LABEL: &str = "target_endpoint";
+
+pub(crate) struct CacheEvidenceMetrics {
+    batches_total: IntCounterVec,
+    mutations_total: IntCounterVec,
+    source_gaps_total: IntCounter,
+    physical_blocks: IntGaugeVec,
+    history_blocks: IntGauge,
+    history_saturated: IntGauge,
+    history_complete: IntGauge,
+    expected_owners: IntGauge,
+    cataloged_owners: IntGauge,
+    physical_scope_complete: IntGauge,
+    telemetry_complete: IntGauge,
+    bounded_fresh_owners: IntGauge,
+    watermark_age_ms: IntGauge,
+    barrier_rtt_seconds: prometheus::Histogram,
+    barrier_timeouts_total: IntCounter,
+    barrier_coalesced_total: IntCounter,
+    barrier_pending: IntGauge,
+    barrier_overflow_total: IntCounter,
+    barrier_incomplete_total: IntCounterVec,
+    cold_epoch_total: IntCounterVec,
+}
+
+static CACHE_EVIDENCE_METRICS: OnceLock<Arc<CacheEvidenceMetrics>> = OnceLock::new();
+
+impl CacheEvidenceMetrics {
+    pub(crate) fn from_component(component: &Component) -> Arc<Self> {
+        CACHE_EVIDENCE_METRICS
+            .get_or_init(|| {
+                let metrics = component.metrics();
+                let labels: &[(&str, &str)] = &[];
+                let batches_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_evidence_batches_total"),
+                        "Cache evidence transport batches by bounded processing result",
+                        &["result"],
+                        labels,
+                    )
+                    .expect("cache evidence batch metrics");
+                let mutations_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_evidence_mutations_total"),
+                        "Cache evidence mutations applied by operation and tier",
+                        &["operation", "tier"],
+                        labels,
+                    )
+                    .expect("cache evidence mutation metrics");
+                let source_gaps_total = metrics
+                    .create_intcounter(
+                        &router_metric("cache_loss_evidence_source_gaps_total"),
+                        "Missing cache evidence source batches",
+                        labels,
+                    )
+                    .expect("cache evidence gap metric");
+                let physical_blocks = metrics
+                    .create_intgaugevec(
+                        &router_metric("cache_loss_physical_blocks"),
+                        "Unique group-specific physical KV blocks in the evidence ledger",
+                        &["tier"],
+                        labels,
+                    )
+                    .expect("cache evidence physical block metric");
+                let gauge = |suffix: &str, help: &str| {
+                    metrics
+                        .create_intgauge(&router_metric(suffix), help, labels)
+                        .unwrap_or_else(|_| panic!("failed to create {suffix}"))
+                };
+                let history_blocks = gauge(
+                    "cache_loss_history_blocks",
+                    "Sequence blocks retained in bounded reuse history",
+                );
+                let history_saturated = gauge(
+                    "cache_loss_history_saturated",
+                    "Whether bounded reuse history has saturated",
+                );
+                let history_complete = gauge(
+                    "cache_loss_history_complete",
+                    "Whether bounded semantic reuse history has remained complete",
+                );
+                let expected_owners = gauge(
+                    "cache_loss_expected_owners",
+                    "Active cache owners expected in the routing domain",
+                );
+                let cataloged_owners = gauge(
+                    "cache_loss_cataloged_owners",
+                    "Active cache owners with a validated cache-group catalog",
+                );
+                let physical_scope_complete = gauge(
+                    "cache_loss_physical_scope_complete",
+                    "Whether all active cache owners supplied cache-group metadata",
+                );
+                let telemetry_complete = gauge(
+                    "cache_loss_evidence_telemetry_complete",
+                    "Whether cache evidence has remained complete since subscription start",
+                );
+                let bounded_fresh_owners = gauge(
+                    "cache_loss_evidence_bounded_fresh_owners",
+                    "Active cache owners whose evidence watermark is within the configured bounded-staleness window",
+                );
+                let watermark_age_ms = gauge(
+                    "cache_loss_evidence_watermark_age_ms",
+                    "Oldest active cache-owner evidence watermark age in milliseconds, or -1 when missing",
+                );
+                let barrier_rtt_seconds = metrics
+                    .create_histogram(
+                        &router_metric("cache_loss_evidence_barrier_rtt_seconds"),
+                        "Route-time cache-evidence barrier round-trip latency",
+                        labels,
+                        Some(prometheus::exponential_buckets(0.0005, 2.0, 12).unwrap()),
+                    )
+                    .expect("cache evidence barrier RTT metric");
+                let barrier_timeouts_total = metrics
+                    .create_intcounter(
+                        &router_metric("cache_loss_evidence_barrier_timeouts_total"),
+                        "Timed out cache-evidence barriers",
+                        labels,
+                    )
+                    .expect("cache evidence barrier timeout metric");
+                let barrier_coalesced_total = metrics
+                    .create_intcounter(
+                        &router_metric("cache_loss_evidence_barrier_coalesced_total"),
+                        "Route snapshots coalesced onto an existing barrier",
+                        labels,
+                    )
+                    .expect("cache evidence barrier coalescing metric");
+                let barrier_pending = gauge(
+                    "cache_loss_evidence_barrier_pending",
+                    "Route snapshots awaiting exact cache-evidence markers",
+                );
+                let barrier_overflow_total = metrics
+                    .create_intcounter(
+                        &router_metric("cache_loss_evidence_barrier_overflow_total"),
+                        "Route snapshots rejected by the bounded barrier journal",
+                        labels,
+                    )
+                    .expect("cache evidence barrier overflow metric");
+                let barrier_incomplete_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_evidence_barrier_incomplete_total"),
+                        "Incomplete route-time cache evidence by fail-closed reason",
+                        &["reason"],
+                        labels,
+                    )
+                    .expect("cache evidence barrier incomplete metric");
+                let cold_epoch_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_cold_epoch_total"),
+                        "Cold cache-history epoch attempts by bounded outcome",
+                        &["result"],
+                        labels,
+                    )
+                    .expect("cold cache-history epoch metric");
+                for result in [
+                    "success",
+                    "readiness_timeout",
+                    "dispatch_drain",
+                    "init",
+                    "control",
+                    "evidence",
+                    "snapshot",
+                    "catalog",
+                    "membership",
+                    "residual_physical_state",
+                    "release",
+                    "cancelled",
+                ] {
+                    cold_epoch_total.with_label_values(&[result]);
+                }
+                for result in [
+                    "applied",
+                    "gap",
+                    "stale",
+                    "publisher_restart",
+                    "decode_error",
+                    "inactive_owner",
+                    "wrong_incarnation",
+                    "legacy",
+                    "watermark",
+                    "stale_watermark",
+                    "watermark_ahead",
+                    "invalid_watermark",
+                ] {
+                    batches_total.with_label_values(&[result]);
+                }
+                for operation in ["store", "remove", "clear"] {
+                    for tier in ["gpu", "cpu", "all"] {
+                        mutations_total.with_label_values(&[operation, tier]);
+                    }
+                }
+                for tier in ["gpu", "cpu"] {
+                    physical_blocks.with_label_values(&[tier]);
+                }
+                Arc::new(Self {
+                    batches_total,
+                    mutations_total,
+                    source_gaps_total,
+                    physical_blocks,
+                    history_blocks,
+                    history_saturated,
+                    history_complete,
+                    expected_owners,
+                    cataloged_owners,
+                    physical_scope_complete,
+                    telemetry_complete,
+                    bounded_fresh_owners,
+                    watermark_age_ms,
+                    barrier_rtt_seconds,
+                    barrier_timeouts_total,
+                    barrier_coalesced_total,
+                    barrier_pending,
+                    barrier_overflow_total,
+                    barrier_incomplete_total,
+                    cold_epoch_total,
+                })
+            })
+            .clone()
+    }
+
+    pub(crate) fn observe_batch(&self, result: &'static str) {
+        self.batches_total.with_label_values(&[result]).inc();
+        if result == "gap" {
+            self.source_gaps_total.inc();
+        }
+    }
+
+    pub(crate) fn observe_mutation(&self, operation: &'static str, tier: &'static str) {
+        self.mutations_total
+            .with_label_values(&[operation, tier])
+            .inc();
+    }
+
+    pub(crate) fn update_state(&self, stats: CacheEvidenceStats) {
+        self.physical_blocks
+            .with_label_values(&["gpu"])
+            .set(stats.gpu_physical_blocks.min(i64::MAX as usize) as i64);
+        self.physical_blocks
+            .with_label_values(&["cpu"])
+            .set(stats.cpu_physical_blocks.min(i64::MAX as usize) as i64);
+        self.history_blocks
+            .set(stats.history_blocks.min(i64::MAX as usize) as i64);
+        self.history_saturated
+            .set(i64::from(stats.history_saturated));
+        self.history_complete.set(i64::from(stats.history_complete));
+        self.expected_owners
+            .set(stats.expected_owners.min(i64::MAX as usize) as i64);
+        self.cataloged_owners
+            .set(stats.cataloged_owners.min(i64::MAX as usize) as i64);
+        self.physical_scope_complete
+            .set(i64::from(stats.physical_scope_complete));
+        self.telemetry_complete
+            .set(i64::from(stats.physical_telemetry_complete));
+    }
+
+    pub(crate) fn update_freshness(
+        &self,
+        expected_owners: usize,
+        bounded_fresh_owners: usize,
+        max_age: Option<Duration>,
+    ) {
+        self.bounded_fresh_owners.set(
+            bounded_fresh_owners
+                .min(expected_owners)
+                .min(i64::MAX as usize) as i64,
+        );
+        self.watermark_age_ms
+            .set(max_age.map_or(-1, |age| age.as_millis().min(i64::MAX as u128) as i64));
+    }
+
+    pub(crate) fn observe_barrier_rtt(&self, rtt: Duration) {
+        self.barrier_rtt_seconds.observe(rtt.as_secs_f64());
+    }
+
+    pub(crate) fn observe_barrier_coalesced(&self, count: usize) {
+        if count > 1 {
+            self.barrier_coalesced_total.inc_by((count - 1) as u64);
+        }
+    }
+
+    pub(crate) fn update_barrier_pending(&self, pending: usize) {
+        self.barrier_pending
+            .set(pending.min(i64::MAX as usize) as i64);
+    }
+
+    pub(crate) fn observe_barrier_incomplete(&self, reason: &'static str) {
+        self.barrier_incomplete_total
+            .with_label_values(&[reason])
+            .inc();
+        if reason == "timeout" {
+            self.barrier_timeouts_total.inc();
+        } else if reason == "journal_overflow" {
+            self.barrier_overflow_total.inc();
+        }
+    }
+
+    pub(crate) fn observe_cold_epoch(&self, result: &'static str) {
+        self.cold_epoch_total.with_label_values(&[result]).inc();
+    }
+}
 
 /// Buckets for CPU-bound compute phases (block hashing, sequence hashing).
 fn compute_overhead_buckets() -> Vec<f64> {
@@ -98,6 +399,16 @@ pub(crate) struct KvPublisherMetrics {
     pub zmq_conversion_issues_total: IntCounterVec,
     /// Total number of suspicious-but-forwarded ZMQ KV events.
     pub zmq_suspicious_events_total: IntCounterVec,
+    /// One while all source batches have remained complete since listener start.
+    pub telemetry_complete: IntGauge,
+    /// Total integrity failures by bounded reason.
+    pub telemetry_incomplete_total: IntCounterVec,
+    /// Missing engine-publisher batches inferred from transport sequence gaps.
+    pub source_sequence_gaps_total: IntCounter,
+    /// Stale or regressed engine-publisher batches.
+    pub source_out_of_order_total: IntCounter,
+    /// Cache-evidence batches waiting for event-plane publication.
+    pub evidence_queue_depth: IntGauge,
 }
 
 static KV_PUBLISHER_METRICS: OnceLock<Arc<KvPublisherMetrics>> = OnceLock::new();
@@ -160,6 +471,43 @@ impl KvPublisherMetrics {
                 &[],
             )
             .expect("failed to create kv_publisher_zmq_suspicious_events_total");
+        let telemetry_complete = metrics
+            .create_intgauge(
+                kv_publisher::TELEMETRY_COMPLETE,
+                "Whether KV event telemetry has remained complete since listener start (1 = complete)",
+                &[],
+            )
+            .expect("failed to create kv_publisher_telemetry_complete");
+        telemetry_complete.set(1);
+        let telemetry_incomplete_total = metrics
+            .create_intcountervec(
+                kv_publisher::TELEMETRY_INCOMPLETE_TOTAL,
+                "Total KV telemetry integrity failures",
+                &["reason"],
+                &[],
+            )
+            .expect("failed to create kv_publisher_telemetry_incomplete_total");
+        let source_sequence_gaps_total = metrics
+            .create_intcounter(
+                kv_publisher::SOURCE_SEQUENCE_GAPS_TOTAL,
+                "Missing engine-publisher batches inferred from source sequence gaps",
+                &[],
+            )
+            .expect("failed to create kv_publisher_source_sequence_gaps_total");
+        let source_out_of_order_total = metrics
+            .create_intcounter(
+                kv_publisher::SOURCE_OUT_OF_ORDER_TOTAL,
+                "Stale or regressed engine-publisher batches",
+                &[],
+            )
+            .expect("failed to create kv_publisher_source_out_of_order_total");
+        let evidence_queue_depth = metrics
+            .create_intgauge(
+                kv_publisher::EVIDENCE_QUEUE_DEPTH,
+                "Cache-evidence batches waiting for event-plane publication",
+                &[],
+            )
+            .expect("failed to create kv_publisher_evidence_queue_depth");
 
         Self {
             engines_dropped_events_total,
@@ -167,6 +515,11 @@ impl KvPublisherMetrics {
             zmq_filtered_events_total,
             zmq_conversion_issues_total,
             zmq_suspicious_events_total,
+            telemetry_complete,
+            telemetry_incomplete_total,
+            source_sequence_gaps_total,
+            source_out_of_order_total,
+            evidence_queue_depth,
         }
     }
 
@@ -196,6 +549,37 @@ impl KvPublisherMetrics {
     pub fn increment_zmq_suspicious_event(&self, event_type: &'static str, reason: &'static str) {
         self.zmq_suspicious_events_total
             .with_label_values(&[event_type, reason])
+            .inc();
+    }
+
+    pub fn record_source_gap(&self, missing_batches: u64) {
+        self.source_sequence_gaps_total.inc_by(missing_batches);
+        self.engines_dropped_events_total.inc_by(missing_batches);
+        self.mark_telemetry_incomplete("source_sequence_gap");
+    }
+
+    pub fn record_source_out_of_order(&self) {
+        self.source_out_of_order_total.inc();
+        self.mark_telemetry_incomplete("source_out_of_order");
+    }
+
+    pub fn increment_evidence_queue_depth(&self) {
+        self.evidence_queue_depth.inc();
+    }
+
+    pub fn decrement_evidence_queue_depth(&self) {
+        self.evidence_queue_depth.dec();
+    }
+
+    pub fn remove_evidence_queue_depth(&self, count: usize) {
+        self.evidence_queue_depth
+            .sub(count.min(i64::MAX as usize) as i64);
+    }
+
+    pub fn mark_telemetry_incomplete(&self, reason: &'static str) {
+        self.telemetry_complete.set(0);
+        self.telemetry_incomplete_total
+            .with_label_values(&[reason])
             .inc();
     }
 }
@@ -843,6 +1227,30 @@ pub struct RouterRequestMetrics {
     pub non_max_overlap_selections_total: IntCounterVec,
     pub overlap_blocks_lost: HistogramVec,
     pub avoidable_prefill_tokens_total: IntCounterVec,
+    pub cache_loss_funnel_tokens_total: IntCounterVec,
+    pub cache_loss_attribution_tokens_total: IntCounterVec,
+    pub cache_loss_observations_total: IntCounterVec,
+    pub cache_loss_router_prediction_tokens_total: IntCounterVec,
+    pub cache_loss_conservation_error_tokens_total: IntCounterVec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLossTerminalKind {
+    Completed,
+    Cancelled,
+    Dropped,
+}
+
+impl CacheLossTerminalKind {
+    const ALL: [Self; 3] = [Self::Completed, Self::Cancelled, Self::Dropped];
+
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Dropped => "dropped",
+        }
+    }
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -984,10 +1392,88 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_avoidable_prefill_tokens_total");
+                let cache_loss_funnel_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_funnel_tokens_total"),
+                        "Prompt tokens surviving each cache-loss funnel stage, split by terminal kind",
+                        &["terminal_kind", "quality", "stage"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_funnel_tokens_total");
+                let cache_loss_attribution_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_attribution_tokens_total"),
+                        "Prompt tokens assigned once within a terminal/evidence-quality bucket to a cache outcome or first loss cause",
+                        &["terminal_kind", "quality", "category"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_attribution_tokens_total");
+                let cache_loss_observations_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_observations_total"),
+                        "Cache-loss observations by terminal kind, evidence quality, and completeness result",
+                        &["terminal_kind", "quality", "result"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_observations_total");
+                let cache_loss_router_prediction_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_router_prediction_tokens_total"),
+                        "Router-visible token predictions compared with physical cache evidence, split by terminal kind",
+                        &["terminal_kind", "quality", "result"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_router_prediction_tokens_total");
+                let cache_loss_conservation_error_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_conservation_error_tokens_total"),
+                        "Absolute prompt-token conservation error within each terminal/evidence-quality bucket",
+                        &["terminal_kind", "quality"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_conservation_error_tokens_total");
                 for worker_type in [WORKER_TYPE_PREFILL, WORKER_TYPE_DECODE] {
                     non_max_overlap_selections_total.with_label_values(&[worker_type]);
                     overlap_blocks_lost.with_label_values(&[worker_type]);
                     avoidable_prefill_tokens_total.with_label_values(&[worker_type]);
+                }
+                for terminal_kind in CacheLossTerminalKind::ALL {
+                    let terminal_kind = terminal_kind.metric_label();
+                for quality in ["exact", "bounded_physical", "incomplete"] {
+                    for stage in ["f0", "f1", "f2", "f3", "f4", "f5", "f6"] {
+                        cache_loss_funnel_tokens_total
+                            .with_label_values(&[terminal_kind, quality, stage]);
+                    }
+                    for category in [
+                        "unavoidable_recomputation",
+                        "retention_loss",
+                        "router_visibility_loss",
+                        "routing_choice_loss",
+                        "eviction_race_loss",
+                        "retrieval_failure",
+                        "gpu_hit",
+                        "cpu_hit",
+                        "incomplete",
+                    ] {
+                        cache_loss_attribution_tokens_total
+                            .with_label_values(&[terminal_kind, quality, category]);
+                    }
+                    for result in [
+                        "complete",
+                        "incomplete_route",
+                        "incomplete_worker",
+                        "missing_join",
+                    ] {
+                        cache_loss_observations_total
+                            .with_label_values(&[terminal_kind, quality, result]);
+                    }
+                    for result in ["false_positive", "false_negative"] {
+                        cache_loss_router_prediction_tokens_total
+                            .with_label_values(&[terminal_kind, quality, result]);
+                    }
+                    cache_loss_conservation_error_tokens_total
+                        .with_label_values(&[terminal_kind, quality]);
+                }
                 }
                 Arc::new(Self {
                     requests_total,
@@ -1002,6 +1488,11 @@ impl RouterRequestMetrics {
                     non_max_overlap_selections_total,
                     overlap_blocks_lost,
                     avoidable_prefill_tokens_total,
+                    cache_loss_funnel_tokens_total,
+                    cache_loss_attribution_tokens_total,
+                    cache_loss_observations_total,
+                    cache_loss_router_prediction_tokens_total,
+                    cache_loss_conservation_error_tokens_total,
                 })
             })
             .clone()
@@ -1024,6 +1515,64 @@ impl RouterRequestMetrics {
         self.avoidable_prefill_tokens_total
             .with_label_values(&[worker_type])
             .inc_by(avoidable_prefill_tokens);
+    }
+
+    pub fn observe_cache_loss(
+        &self,
+        funnel: &CacheLossFunnel,
+        terminal_kind: CacheLossTerminalKind,
+        quality: &'static str,
+        result: &'static str,
+    ) {
+        let terminal_kind = terminal_kind.metric_label();
+        for (stage, value) in [
+            ("f0", funnel.f0_backend_prompt_tokens),
+            ("f1", funnel.f1_reusable_tokens),
+            ("f2", funnel.f2_physically_resident_tokens),
+            ("f3", funnel.f3_router_visible_tokens),
+            ("f4", funnel.f4_selected_resident_tokens),
+            ("f5", funnel.f5_lookup_resident_tokens),
+            ("f6", funnel.f6_reused_tokens),
+        ] {
+            self.cache_loss_funnel_tokens_total
+                .with_label_values(&[terminal_kind, quality, stage])
+                .inc_by(value);
+        }
+        for (category, value) in [
+            (
+                "unavoidable_recomputation",
+                funnel.unavoidable_recomputation,
+            ),
+            ("retention_loss", funnel.retention_loss),
+            ("router_visibility_loss", funnel.router_visibility_loss),
+            ("routing_choice_loss", funnel.routing_choice_loss),
+            ("eviction_race_loss", funnel.eviction_race_loss),
+            ("retrieval_failure", funnel.retrieval_failure),
+            ("gpu_hit", funnel.gpu_hits),
+            ("cpu_hit", funnel.cpu_hits),
+            ("incomplete", funnel.incomplete_tokens),
+        ] {
+            self.cache_loss_attribution_tokens_total
+                .with_label_values(&[terminal_kind, quality, category])
+                .inc_by(value);
+        }
+        self.cache_loss_observations_total
+            .with_label_values(&[terminal_kind, quality, result])
+            .inc();
+        self.cache_loss_router_prediction_tokens_total
+            .with_label_values(&[terminal_kind, quality, "false_positive"])
+            .inc_by(funnel.router_false_positive_tokens);
+        self.cache_loss_router_prediction_tokens_total
+            .with_label_values(&[terminal_kind, quality, "false_negative"])
+            .inc_by(funnel.router_false_negative_tokens);
+        self.cache_loss_conservation_error_tokens_total
+            .with_label_values(&[terminal_kind, quality])
+            .inc_by(
+                funnel
+                    .conservation_error()
+                    .unsigned_abs()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
     }
 }
 
@@ -1085,6 +1634,14 @@ mod tests {
         let mut buffer = Vec::new();
         encoder.encode(&registry.gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+
+    #[test]
+    fn cache_loss_terminal_kind_labels_are_bounded_and_distinct() {
+        assert_eq!(
+            CacheLossTerminalKind::ALL.map(CacheLossTerminalKind::metric_label),
+            ["completed", "cancelled", "dropped"]
+        );
     }
 
     #[test]
@@ -1520,6 +2077,7 @@ mod kv_publisher_registration_tests {
         metrics.increment_zmq_filtered_event("stored", "no_blocks");
         metrics.increment_zmq_conversion_issue("stored", "bad_hash");
         metrics.increment_zmq_suspicious_event("stored", "large_batch");
+        metrics.mark_telemetry_incomplete("test");
 
         let expfmt = hierarchy.expfmt();
         for suffix in [
@@ -1528,6 +2086,10 @@ mod kv_publisher_registration_tests {
             kv_publisher::ZMQ_FILTERED_EVENTS_TOTAL,
             kv_publisher::ZMQ_CONVERSION_ISSUES_TOTAL,
             kv_publisher::ZMQ_SUSPICIOUS_EVENTS_TOTAL,
+            kv_publisher::TELEMETRY_COMPLETE,
+            kv_publisher::TELEMETRY_INCOMPLETE_TOTAL,
+            kv_publisher::SOURCE_SEQUENCE_GAPS_TOTAL,
+            kv_publisher::SOURCE_OUT_OF_ORDER_TOTAL,
         ] {
             let name = exported_name(suffix);
             assert!(
@@ -1535,6 +2097,18 @@ mod kv_publisher_registration_tests {
                 "{name} never reached the metrics registry. Exposition was:\n{expfmt}"
             );
         }
+    }
+
+    #[test]
+    fn kv_telemetry_completeness_is_sticky_after_integrity_failure() {
+        let hierarchy = FakeHierarchy::component("dynamo", "backend", 0x7f3a1c);
+        let metrics = KvPublisherMetrics::build(&hierarchy);
+
+        assert_eq!(metrics.telemetry_complete.get(), 1);
+        metrics.mark_telemetry_incomplete("source_decode_error");
+        assert_eq!(metrics.telemetry_complete.get(), 0);
+        metrics.mark_telemetry_incomplete("conversion_error");
+        assert_eq!(metrics.telemetry_complete.get(), 0);
     }
 
     #[test]

@@ -44,10 +44,12 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod cache_loss;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
 pub mod prefill_router;
+pub mod prompt_source_outcome;
 pub mod publisher;
 pub mod push_router;
 mod route_lookup;
@@ -170,10 +172,13 @@ impl fmt::Display for KvEventSourceRequirement {
 pub enum FindBestMatchOutcome {
     Routed {
         worker: WorkerWithDpRank,
+        selected_discovery_incarnation: Option<u64>,
+        selected_cache_evidence_incarnation: Option<u64>,
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         potential_decode_blocks: u64,
+        cache_loss_router_visible_tokens: Option<u64>,
         routing_hashes: Option<RoutingDecisionHashes>,
         router_hint: Option<RouterHint>,
     },
@@ -354,6 +359,7 @@ where
     client: Client,
     is_eagle: bool,
     kv_event_subscription: Option<indexer::KvEventSubscriptionHandle>,
+    cache_evidence_subscription: Option<cache_loss::CacheEvidenceSubscription>,
     tracking_hash: TrackingHashContext,
     tracking_model_name: String,
     _served_indexer_handle: Option<ServedIndexerHandle>,
@@ -504,7 +510,23 @@ where
             cancellation_token.child_token(),
         )
         .await?;
-
+        let cache_evidence_subscription = if cache_loss::enabled() {
+            let membership_watch = kv_source_membership.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "KV source membership watch is required when cache-loss instrumentation is enabled"
+                )
+            })?;
+            Some(
+                cache_loss::start_cache_evidence_subscriber(
+                    component.clone(),
+                    membership_watch.fork_receiver(),
+                    cancellation_token.child_token(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         // Start KV event subscription if needed — skip when using a remote indexer.
         let kv_event_subscription = if kv_event_source_requirement
             .should_subscribe(&kv_router_config)
@@ -569,6 +591,7 @@ where
             client,
             is_eagle,
             kv_event_subscription,
+            cache_evidence_subscription,
             tracking_hash,
             tracking_model_name,
             _served_indexer_handle: served_indexer_handle,
@@ -609,10 +632,124 @@ where
         &self.kv_router_config
     }
 
+    pub fn cache_evidence_ledger(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<dynamo_kv_router::cache_loss::CacheEvidenceLedger>>> {
+        self.cache_evidence_subscription
+            .as_ref()
+            .map(cache_loss::CacheEvidenceSubscription::ledger)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_loss_route_observation(
+        &self,
+        tokens: &[u32],
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        lora_name: Option<&str>,
+        cache_namespace: Option<&str>,
+        selected: WorkerWithDpRank,
+        selected_serving_incarnation: Option<u64>,
+        router_visible_prefix_tokens: Option<u64>,
+    ) -> Option<cache_loss::CacheLossRouteObservation> {
+        let subscription = self.cache_evidence_subscription.as_ref()?;
+        Some(subscription.snapshot_route(
+            tokens,
+            block_mm_infos,
+            lora_name,
+            cache_namespace,
+            selected,
+            selected_serving_incarnation,
+            router_visible_prefix_tokens.unwrap_or(0),
+        ))
+    }
+
+    pub fn record_cache_group_catalog(
+        &self,
+        worker: WorkerWithDpRank,
+        groups: &[crate::protocols::common::timing::CacheGroupObservation],
+    ) -> bool {
+        self.cache_evidence_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.record_group_catalog(
+                    dynamo_kv_router::cache_loss::CacheOwner {
+                        worker_id: worker.worker_id,
+                        dp_rank: worker.dp_rank,
+                    },
+                    groups,
+                )
+            })
+    }
+
+    pub fn cache_loss_history_enabled(&self) -> bool {
+        self.cache_evidence_subscription.is_some()
+    }
+
+    pub async fn wait_for_cache_history_dispatch_gate(&self) -> anyhow::Result<()> {
+        if let Some(subscription) = &self.cache_evidence_subscription {
+            subscription.wait_for_dispatch_gate().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn acquire_cache_history_dispatch_fence(
+        &self,
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        match &self.cache_evidence_subscription {
+            Some(subscription) => Some(subscription.acquire_dispatch_fence().await),
+            None => None,
+        }
+    }
+
+    pub fn cache_loss_history_epoch(&self) -> Option<u64> {
+        self.cache_evidence_subscription
+            .as_ref()
+            .map(cache_loss::CacheEvidenceSubscription::history_epoch)
+    }
+
+    pub fn mark_cache_loss_history_incomplete(&self) {
+        if let Some(subscription) = &self.cache_evidence_subscription {
+            subscription.mark_history_incomplete();
+        }
+    }
+
+    pub fn mark_cache_loss_history_incomplete_for_epoch(&self, epoch: u64) -> bool {
+        self.cache_evidence_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.mark_history_incomplete_for_epoch(epoch))
+    }
+
+    pub fn record_completed_token_history(
+        &self,
+        worker: WorkerWithDpRank,
+        history_epoch: u64,
+        tokens: &[u32],
+        lora_name: Option<&str>,
+        cache_namespace: Option<&str>,
+    ) -> bool {
+        self.cache_evidence_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.record_completed_token_history(
+                    dynamo_kv_router::cache_loss::CacheOwner {
+                        worker_id: worker.worker_id,
+                        dp_rank: worker.dp_rank,
+                    },
+                    history_epoch,
+                    tokens,
+                    lora_name,
+                    cache_namespace,
+                )
+            })
+    }
+
     /// Cancel background work and wait for KV event ingestion to stop.
     pub async fn shutdown(mut self) {
         self.cancellation_token.cancel();
         if let Some(subscription) = self.kv_event_subscription.take() {
+            subscription.shutdown().await;
+        }
+        if let Some(subscription) = self.cache_evidence_subscription.take() {
             subscription.shutdown().await;
         }
     }
@@ -1036,6 +1173,10 @@ where
         let overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
+        let cache_loss_router_visible_tokens = self
+            .cache_evidence_subscription
+            .as_ref()
+            .map(|_| max_router_visible_tokens(&overlap, self.block_size));
         let router_hint_candidates = retain_router_hint_chain
             .then(|| tiered_matches.router_hint_root_candidates().cloned())
             .flatten();
@@ -1160,10 +1301,14 @@ where
             FindBestMatchAdmission::WithAdmission { .. } => Ok(
                 FindBestMatchInnerOutcome::WithAdmission(FindBestMatchOutcome::Routed {
                     worker: response.best_worker,
+                    selected_discovery_incarnation: response.selected_discovery_incarnation,
+                    selected_cache_evidence_incarnation: response
+                        .selected_cache_evidence_incarnation,
                     overlap_blocks: response.effective_overlap_blocks.round() as u32,
                     effective_overlap_blocks: response.effective_overlap_blocks,
                     cached_tokens: response.cached_tokens,
                     potential_decode_blocks: response.potential_decode_blocks as u64,
+                    cache_loss_router_visible_tokens,
                     routing_hashes,
                     router_hint,
                 }),
@@ -1316,6 +1461,16 @@ where
     /// Sum of ISL tokens for requests currently parked in the scheduler queue.
     pub fn pending_isl_tokens(&self) -> usize {
         self.scheduler.pending_isl_tokens()
+    }
+
+    pub fn prompt_source_registry(
+        &self,
+    ) -> Option<prompt_source_outcome::TerminalPromptSourceRegistry> {
+        self.scheduler.prompt_source_registry()
+    }
+
+    pub fn router_id(&self) -> u64 {
+        self.scheduler.router_id()
     }
 
     fn prefill_load_hint_for(
@@ -1566,6 +1721,25 @@ where
     pub async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
         self.indexer.dump_events().await
     }
+}
+
+fn max_router_visible_tokens(
+    overlap: &dynamo_kv_router::scheduling::OverlapSignals,
+    block_size: u32,
+) -> u64 {
+    let tiers = &overlap.tier_overlap_blocks;
+    let max_blocks = tiers
+        .device
+        .iter()
+        .map(|(worker, device)| {
+            device.saturating_add(tiers.host_pinned.get(worker).copied().unwrap_or(0))
+        })
+        .chain(tiers.host_pinned.iter().map(|(worker, host)| {
+            host.saturating_add(tiers.device.get(worker).copied().unwrap_or(0))
+        }))
+        .max()
+        .unwrap_or(0);
+    (max_blocks as u64).saturating_mul(u64::from(block_size))
 }
 
 // NOTE: KVRouter works like a PushRouter,

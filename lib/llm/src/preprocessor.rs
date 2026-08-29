@@ -261,6 +261,9 @@ fn drain_router_routing_data(
     if let Some(token_ids) = routing_data.token_ids {
         tracker.set_external_query_token_ids(token_ids);
     }
+    if let Some(observation) = routing_data.cache_source_observation {
+        tracker.record_cache_source_observation(observation);
+    }
 }
 
 fn attach_metrics_annotation<Resp>(response: &mut Annotated<Resp>, metrics: &LLMMetricAnnotation) {

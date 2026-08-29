@@ -2078,7 +2078,9 @@ mod tests {
                 raw_store(Some("CPU_PINNED"), Some("kvcr"), 103),
                 raw_store(Some("STORAGE"), Some("kvcr"), 104),
                 RawKvEvent::AllBlocksCleared {
+                    medium: None,
                     ownership: Some("kvcr".to_string()),
+                    epoch_id: None,
                 },
             ],
             worker,

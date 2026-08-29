@@ -8,6 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use dynamo_kv_router::cache_loss::{CacheEvidenceBatch, KV_CACHE_EVIDENCE_SUBJECT};
 use dynamo_kv_router::indexer::{KvIndexerMetrics, LocalKvIndexer};
 use dynamo_kv_router::protocols::*;
 pub use dynamo_kv_router::zmq_wire::create_stored_blocks;
@@ -20,8 +21,9 @@ use dynamo_runtime::traits::DistributedRuntimeProvider;
 
 use crate::discovery::KvEventSource as DiscoveredKvEventSource;
 use crate::kv_router::{
-    KV_EVENT_SUBJECT, WORKER_KV_INDEXER_BUFFER_SIZE, indexer::start_worker_kv_query_endpoint,
-    metrics::KvPublisherMetrics,
+    KV_EVENT_SUBJECT, WORKER_KV_INDEXER_BUFFER_SIZE,
+    indexer::start_worker_kv_query_endpoint,
+    metrics::{KvPublisherMetrics, kv_publisher_metrics},
 };
 
 mod attachment_owner;
@@ -63,6 +65,7 @@ use zmq_listener::start_zmq_listener;
 const MAX_BATCHING_TIMEOUT_MS: u64 = 15_000;
 pub const DEFAULT_BATCHING_TIMEOUT_MS: Option<u64> = None;
 const DEFAULT_MAX_BATCH_BLOCKS: usize = 128;
+const CACHE_LOSS_FUNNEL_ENABLED_ENV: &str = "DYN_CACHE_LOSS_FUNNEL_ENABLED";
 
 /// Configure the source of KV events.
 /// Currently, only ZMQ is supported.
@@ -117,13 +120,17 @@ async fn supervise_zmq_listener(
 }
 
 impl KvEventSource {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         component: Component,
         worker_id: WorkerId,
+        dp_rank: DpRank,
+        evidence_incarnation_id: u64,
         kv_block_size: u32,
         source_config: KvEventSourceConfig,
         cancellation_token: CancellationToken,
         tx: mpsc::UnboundedSender<Vec<PlacementEvent>>,
+        evidence_tx: Option<mpsc::UnboundedSender<CacheEvidenceBatch>>,
         next_event_id: Arc<AtomicU64>,
     ) -> Result<Self> {
         match source_config {
@@ -141,7 +148,10 @@ impl KvEventSource {
                             endpoint.clone(),
                             topic.clone(),
                             worker_id,
+                            dp_rank,
+                            evidence_incarnation_id,
                             tx,
+                            evidence_tx,
                             cancellation_token.clone(),
                             kv_block_size,
                             next_event_id,
@@ -310,7 +320,21 @@ impl KvEventPublisher {
             .map(|ms| ms.min(MAX_BATCHING_TIMEOUT_MS));
 
         let (tx, rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
+        let evidence_enabled = std::env::var(CACHE_LOSS_FUNNEL_ENABLED_ENV)
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        let (evidence_tx, evidence_rx) = if evidence_enabled {
+            let (tx, rx) = mpsc::unbounded_channel::<CacheEvidenceBatch>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let worker_id = worker_id.unwrap_or_else(|| component.drt().connection_id());
+        let evidence_incarnation_id = loop {
+            let candidate = rand::random::<u64>() & ((1_u64 << 53) - 1);
+            if candidate != 0 {
+                break candidate;
+            }
+        };
 
         let _ = KvPublisherMetrics::from_component(&component);
 
@@ -333,10 +357,13 @@ impl KvEventPublisher {
             source = Some(KvEventSource::start(
                 component.clone(),
                 worker_id,
+                dp_rank,
+                evidence_incarnation_id,
                 kv_block_size,
                 config,
                 cancellation_token.clone(),
                 tx.clone(),
+                evidence_tx,
                 next_event_id.clone(),
             )?);
         }
@@ -355,6 +382,61 @@ impl KvEventPublisher {
 
         let cancellation_token_clone = cancellation_token.clone();
         let local_indexer_clone = local_indexer.clone();
+
+        if let Some(mut evidence_rx) = evidence_rx {
+            let endpoint_clone = endpoint.clone();
+            let evidence_endpoint = kv_state_endpoint.clone();
+            let evidence_cancellation = cancellation_token.clone();
+            component.drt().runtime().secondary().spawn(async move {
+                let publisher =
+                    match dynamo_runtime::transports::event_plane::EventPublisher::for_endpoint_id(
+                        endpoint_clone.drt(),
+                        &evidence_endpoint,
+                        KV_CACHE_EVIDENCE_SUBJECT,
+                    )
+                    .await
+                    {
+                        Ok(publisher) => publisher,
+                        Err(error) => {
+                            tracing::error!(%error, "Failed to create cache-evidence publisher");
+                            evidence_rx.close();
+                            if let Some(metrics) = kv_publisher_metrics() {
+                                metrics.remove_evidence_queue_depth(evidence_rx.len());
+                                metrics.mark_telemetry_incomplete("event_plane_publisher_error");
+                            }
+                            return;
+                        }
+                    };
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = evidence_cancellation.cancelled() => break,
+                        batch = evidence_rx.recv() => {
+                            let Some(batch) = batch else { break; };
+                            if let Some(metrics) = kv_publisher_metrics() {
+                                metrics.decrement_evidence_queue_depth();
+                            }
+                            if let Err(error) = publisher.publish(&batch).await {
+                                tracing::error!(
+                                    %error,
+                                    worker_id = batch.owner.worker_id,
+                                    dp_rank = batch.owner.dp_rank,
+                                    source_cursor = batch.source_cursor,
+                                    "Failed to publish cache evidence"
+                                );
+                                if let Some(metrics) = kv_publisher_metrics() {
+                                    metrics.mark_telemetry_incomplete("event_plane_publish_error");
+                                }
+                            }
+                        }
+                    }
+                }
+                evidence_rx.close();
+                if let Some(metrics) = kv_publisher_metrics() {
+                    metrics.remove_evidence_queue_depth(evidence_rx.len());
+                }
+            });
+        }
 
         tracing::info!("Using event plane for KV event publishing");
         let endpoint_clone = endpoint.clone();
@@ -412,6 +494,7 @@ impl KvEventPublisher {
                 kv_state_endpoint: kv_state_endpoint.clone(),
                 worker: WorkerWithDpRank::new(worker_id, dp_rank),
                 publisher_id,
+                evidence_incarnation_id: evidence_enabled.then_some(evidence_incarnation_id),
                 recovery_target: recovery_endpoint
                     .as_ref()
                     .map(|endpoint| endpoint.instance().clone()),

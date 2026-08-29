@@ -56,6 +56,7 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
         let mut block_mm_infos: Option<Option<Vec<Option<BlockExtraInfo>>>> = None;
         let mut locality: Option<Option<Locality>> = None;
         let mut ownership: Option<Option<String>> = None;
+        let mut epoch_id: Option<Option<String>> = None;
         let mut metadata = KvCacheEventMetadata::default();
 
         while let Some(key) = map.next_key::<String>()? {
@@ -104,6 +105,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 }
                 "ownership" => {
                     ownership = Some(map.next_value()?);
+                }
+                "epoch_id" => {
+                    epoch_id = Some(map.next_value()?);
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
@@ -160,7 +164,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared {
+                medium: normalize_medium(medium.unwrap_or(None)),
                 ownership: ownership.unwrap_or(None),
+                epoch_id: epoch_id.unwrap_or(None),
             }),
             Some("Ignored") => Ok(RawKvEvent::Ignored),
             Some(other) => Err(de::Error::unknown_variant(
@@ -268,9 +274,27 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             "AllBlocksCleared" => {
-                let ownership: Option<String> = seq.next_element()?.unwrap_or(None);
+                let first: Option<String> = seq.next_element()?.unwrap_or(None);
+                // Legacy Dynamo enrichment appended only `ownership`. The new
+                // vLLM shape appends `medium` first and ownership, if any, next.
+                let (medium, ownership, epoch_id) = if first.as_deref() == Some("kvcr") {
+                    (None, first, seq.next_element()?.unwrap_or(None))
+                } else {
+                    let medium = normalize_medium(first);
+                    let second: Option<String> = seq.next_element()?.unwrap_or(None);
+                    if second.as_deref().is_some_and(is_epoch_token) {
+                        (medium, None, second)
+                    } else {
+                        let epoch_id = seq.next_element()?.unwrap_or(None);
+                        (medium, second, epoch_id)
+                    }
+                };
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(RawKvEvent::AllBlocksCleared { ownership })
+                Ok(RawKvEvent::AllBlocksCleared {
+                    medium,
+                    ownership,
+                    epoch_id,
+                })
             }
             "Ignored" => {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -282,6 +306,10 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
             )),
         }
     }
+}
+
+fn is_epoch_token(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 struct ParsedCommonTrailing {

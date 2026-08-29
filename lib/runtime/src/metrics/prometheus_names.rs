@@ -804,6 +804,21 @@ pub mod kv_publisher {
 
     /// Total number of suspicious-but-forwarded ZMQ KV events, labeled by event type and reason
     pub const ZMQ_SUSPICIOUS_EVENTS_TOTAL: &str = "kv_publisher_zmq_suspicious_events_total";
+
+    /// Whether KV event telemetry has remained complete since listener start
+    pub const TELEMETRY_COMPLETE: &str = "kv_publisher_telemetry_complete";
+
+    /// Total KV telemetry integrity failures, labeled by bounded reason
+    pub const TELEMETRY_INCOMPLETE_TOTAL: &str = "kv_publisher_telemetry_incomplete_total";
+
+    /// Total missing engine-publisher batches inferred from source sequence gaps
+    pub const SOURCE_SEQUENCE_GAPS_TOTAL: &str = "kv_publisher_source_sequence_gaps_total";
+
+    /// Total stale or regressed engine-publisher batches
+    pub const SOURCE_OUT_OF_ORDER_TOTAL: &str = "kv_publisher_source_out_of_order_total";
+
+    /// Cache-evidence batches waiting for event-plane publication
+    pub const EVIDENCE_QUEUE_DEPTH: &str = "kv_publisher_evidence_queue_depth";
 }
 
 /// Additional TRT-LLM worker metrics beyond what the engine natively provides.

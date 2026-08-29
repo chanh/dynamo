@@ -50,6 +50,13 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    observer: Option<Arc<dyn RawKvEventObserver>>,
+}
+
+/// Side-channel observer for validated local residency events, including
+/// hybrid cache groups intentionally filtered out of the routing index.
+pub trait RawKvEventObserver: std::fmt::Debug + Send + Sync {
+    fn observe(&self, event: &RawKvEvent, worker: WorkerWithDpRank);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +110,7 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            observer: None,
         }
     }
 
@@ -113,7 +121,13 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            observer: None,
         }
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn RawKvEventObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Set the model's image placeholder token id so vLLM BlockStored events
@@ -186,6 +200,10 @@ impl ZmqEventNormalizer {
                 Some(_) => return Ok(raw),
                 None => return Err(ZmqEventFilterReason::UnknownMedium),
             }
+        }
+
+        if let Some(observer) = &self.observer {
+            observer.observe(&raw, worker);
         }
 
         let metadata = raw.metadata();

@@ -109,6 +109,8 @@ impl KvSchedulerError {
 #[derive(Debug)]
 pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
+    pub selected_discovery_incarnation: Option<u64>,
+    pub selected_cache_evidence_incarnation: Option<u64>,
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,

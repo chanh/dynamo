@@ -46,6 +46,8 @@ use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
+const PROMPT_SOURCE_ORIGIN_ROUTER_ID_KEY: &str = "dynamo-prompt-source-origin-router-id";
+const PROMPT_SOURCE_REGISTRATION_NONCE_KEY: &str = "dynamo-prompt-source-registration-nonce";
 
 fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
@@ -277,6 +279,7 @@ where
         selection: &mut WorkerSelection,
         is_query_only: bool,
     ) -> Result<RequestGuard<Sel>, Error> {
+        self.chooser.wait_for_cache_history_dispatch_gate().await?;
         let context_id = request.context().id().to_string();
         let request_context = request.context().clone();
         let routing_parts = RoutingRequestParts::new(request);
@@ -290,6 +293,16 @@ where
             request,
             !is_query_only,
         );
+        let routing = request.routing.as_ref();
+        guard.set_cache_loss_route(self.chooser.cache_loss_route_observation(
+            routing_parts.token_ids,
+            routing_parts.block_mm_infos,
+            routing.and_then(|value| value.lora_name.as_deref()),
+            routing.and_then(|value| value.cache_namespace.as_deref()),
+            selected_worker,
+            selection.cache_evidence_incarnation,
+            selection.cache_loss_router_visible_tokens,
+        ));
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && self.chooser.indexer().records_routing_decisions() {
@@ -357,6 +370,7 @@ where
             guard.abort().await;
             return Err(error);
         }
+        cancel_on_stop(request_context.as_ref(), guard.finalize_cache_loss_route()).await?;
         Ok(guard)
     }
 
@@ -378,7 +392,14 @@ where
         guard.start_dispatch(&phase_label);
         self.warn_if_output_replay_annotation_ignored(&request, &selection);
 
-        let (mut backend_input, context) = request.into_parts();
+        let (mut backend_input, mut context) = request.into_parts();
+        context.insert_metadata(
+            PROMPT_SOURCE_ORIGIN_ROUTER_ID_KEY,
+            self.chooser.router_id().to_string(),
+        );
+        if let Some(nonce) = guard.terminal_prompt_source_nonce() {
+            context.insert_metadata(PROMPT_SOURCE_REGISTRATION_NONCE_KEY, nonce.to_string());
+        }
         backend_input.routing_mut().dp_rank = Some(selection.worker.dp_rank);
         let _ = backend_input
             .extra_args
@@ -490,6 +511,8 @@ where
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
         let is_query_only = request.get_annotation_value("query_instance_id").is_some();
+        let _cache_history_dispatch_fence =
+            self.chooser.acquire_cache_history_dispatch_fence().await;
         let (mut selection, mut operation) = self
             .select_with_affinity(&request, phase, is_query_only)
             .await?;
@@ -567,6 +590,8 @@ where
             .unwrap_or(RequestPhase::Aggregated);
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
+        let _cache_history_dispatch_fence =
+            self.chooser.acquire_cache_history_dispatch_fence().await;
         let (mut selection, mut operation) = self
             .select_with_affinity(&request, phase, is_query_only)
             .await?;

@@ -35,6 +35,7 @@ fn base_runtime_config_watch(
 
     tokio::spawn(async move {
         let mut configs = HashMap::new();
+        let mut next_incarnation = 0_u64;
         loop {
             let result = tokio::select! {
                 _ = lifecycle.cancelled() => break,
@@ -48,7 +49,7 @@ fn base_runtime_config_watch(
                     let DiscoveryInstanceId::Model(id) = instance.id() else {
                         continue;
                     };
-                    let card = match instance.deserialize_model::<ModelDeploymentCard>() {
+                    let mut card = match instance.deserialize_model::<ModelDeploymentCard>() {
                         Ok(card) => card,
                         Err(error) => {
                             tracing::warn!(
@@ -62,6 +63,11 @@ fn base_runtime_config_watch(
                     if id.model_suffix.is_some() || card.lora.is_some() {
                         continue;
                     }
+                    next_incarnation = next_incarnation.wrapping_add(1).max(1);
+                    card.runtime_config.runtime_data.insert(
+                        ModelRuntimeConfig::DISCOVERY_INCARNATION_RUNTIME_KEY.to_string(),
+                        serde_json::Value::from(next_incarnation),
+                    );
                     configs.insert(id.instance_id, card.runtime_config);
                 }
                 Ok(DiscoveryEvent::ModelTaintsUpdated(update)) => {

@@ -294,6 +294,14 @@ class kv_publisher:
     ZMQ_CONVERSION_ISSUES_TOTAL = "kv_publisher_zmq_conversion_issues_total"
     # Total number of suspicious-but-forwarded ZMQ KV events, labeled by event type and reason
     ZMQ_SUSPICIOUS_EVENTS_TOTAL = "kv_publisher_zmq_suspicious_events_total"
+    # Whether KV event telemetry has remained complete since listener start
+    TELEMETRY_COMPLETE = "kv_publisher_telemetry_complete"
+    # Total KV telemetry integrity failures, labeled by bounded reason
+    TELEMETRY_INCOMPLETE_TOTAL = "kv_publisher_telemetry_incomplete_total"
+    # Total missing engine-publisher batches inferred from source sequence gaps
+    SOURCE_SEQUENCE_GAPS_TOTAL = "kv_publisher_source_sequence_gaps_total"
+    # Total stale or regressed engine-publisher batches
+    SOURCE_OUT_OF_ORDER_TOTAL = "kv_publisher_source_out_of_order_total"
 
 
 class kvbm:

@@ -200,6 +200,7 @@ fn register_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DistributedRuntime>()?;
     m.add_class::<llm::replay::OfflineReplayResult>()?;
     m.add_class::<Endpoint>()?;
+    m.add_class::<PyPromptSourcePublisher>()?;
     m.add_class::<ModelCardInstanceId>()?;
     m.add_class::<Client>()?;
     m.add_class::<Instance>()?;
@@ -876,6 +877,26 @@ struct Endpoint {
     event_loop: PyObject,
 }
 
+#[pyclass(name = "PromptSourcePublisher")]
+#[derive(Clone)]
+struct PyPromptSourcePublisher {
+    inner: llm_rs::kv_router::prompt_source_outcome::TerminalPromptSourcePublisher,
+}
+
+#[pymethods]
+impl PyPromptSourcePublisher {
+    fn publish(&self, py: Python<'_>, outcome: PyObject) -> PyResult<bool> {
+        let outcome = pythonize::depythonize::<
+            llm_rs::kv_router::prompt_source_outcome::TerminalPromptSourceOutcome,
+        >(&outcome.into_bound(py))?;
+        Ok(self.inner.try_publish(outcome).is_ok())
+    }
+
+    fn observe_control_result(&self, result: &str) {
+        self.inner.observe_control_result(result);
+    }
+}
+
 #[pyclass]
 #[derive(Clone)]
 struct ModelCardInstanceId {
@@ -1396,6 +1417,18 @@ impl DistributedRuntime {
 
 #[pymethods]
 impl Endpoint {
+    fn prompt_source_publisher<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let endpoint = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = llm_rs::kv_router::prompt_source_outcome::TerminalPromptSourcePublisher::for_endpoint(
+                &endpoint,
+            )
+            .await
+            .map_err(to_pyerr)?;
+            Ok(PyPromptSourcePublisher { inner })
+        })
+    }
+
     #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None))]
     fn serve_endpoint<'p>(
         &self,

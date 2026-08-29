@@ -286,6 +286,17 @@ pub trait WorkerConfigLike {
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
 
+    /// Frontend-local lifecycle of this exact serving registration. Selectors
+    /// return it with the chosen worker so downstream evidence cannot bind a
+    /// decision to a different process that reused the same logical ID.
+    fn discovery_incarnation(&self) -> Option<u64> {
+        None
+    }
+
+    fn cache_evidence_serving_incarnation(&self, _dp_rank: DpRank) -> Option<u64> {
+        None
+    }
+
     /// Router-hint capability and source metadata for a specific global DP rank.
     ///
     /// `None` means this worker/rank does not support router hints. Backends

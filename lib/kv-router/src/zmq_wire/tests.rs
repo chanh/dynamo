@@ -16,6 +16,60 @@ use crate::protocols::{
 use super::filter::KvCacheSpecKind;
 use super::*;
 
+#[test]
+fn kv_event_batch_decodes_legacy_and_barrier_wire_shapes() {
+    let legacy = rmp_serde::to_vec(&(1.0_f64, Vec::<RawKvEvent>::new(), Some(3_i32))).unwrap();
+    let barrier =
+        rmp_serde::to_vec(&(1.0_f64, Vec::<RawKvEvent>::new(), Some(3_i32), Some(41_u64))).unwrap();
+    let epoch = rmp_serde::to_vec(&(
+        1.0_f64,
+        Vec::<RawKvEvent>::new(),
+        Some(3_i32),
+        Some(41_u64),
+        Some("0123456789abcdef0123456789abcdef"),
+    ))
+    .unwrap();
+
+    let legacy = decode_event_batch(&legacy).unwrap();
+    assert_eq!(legacy.data_parallel_rank, Some(3));
+    assert_eq!(legacy.barrier_id, None);
+    let barrier = decode_event_batch(&barrier).unwrap();
+    assert_eq!(barrier.data_parallel_rank, Some(3));
+    assert_eq!(barrier.barrier_id, Some(41));
+    assert_eq!(barrier.epoch_id, None);
+    let epoch = decode_event_batch(&epoch).unwrap();
+    assert_eq!(epoch.barrier_id, Some(41));
+    assert_eq!(
+        epoch.epoch_id.as_deref(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+}
+
+#[test]
+fn tier_clear_decodes_optional_epoch_token() {
+    let encoded = to_vec_named(&serde_json::json!({
+        "type": "AllBlocksCleared",
+        "medium": "CPU",
+        "epoch_id": "0123456789abcdef0123456789abcdef",
+    }))
+    .unwrap();
+    let event: RawKvEvent = from_slice(&encoded).unwrap();
+
+    assert_eq!(event.medium(), Some("CPU"));
+    assert_eq!(event.epoch_id(), Some("0123456789abcdef0123456789abcdef"));
+}
+
+#[test]
+fn positional_tier_clear_distinguishes_epoch_token_from_legacy_ownership() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let event: RawKvEvent =
+        from_slice(&to_vec(&("AllBlocksCleared", Some("CPU"), Some(token))).unwrap()).unwrap();
+
+    assert_eq!(event.medium(), Some("CPU"));
+    assert_eq!(event.epoch_id(), Some(token));
+    assert_eq!(event.ownership(), Ok(KvEventOwnership::Framework));
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TestEventKind {
     BlockStored,
@@ -76,6 +130,11 @@ fn decodes_ownership_on_positional_events() {
 
     let cleared: RawKvEvent = from_slice(&to_vec(&("AllBlocksCleared", "kvcr")).unwrap()).unwrap();
     assert_eq!(cleared.ownership(), Ok(KvEventOwnership::Kvcr));
+
+    let gpu_cleared: RawKvEvent =
+        from_slice(&to_vec(&("AllBlocksCleared", "GPU", Option::<String>::None)).unwrap()).unwrap();
+    assert_eq!(gpu_cleared.medium(), Some("GPU"));
+    assert_eq!(gpu_cleared.ownership(), Ok(KvEventOwnership::Framework));
 }
 
 #[derive(Serialize)]
@@ -629,6 +688,31 @@ fn test_normalizer_ignores_non_main_group_idx_without_metadata() {
             .unwrap_err(),
         ZmqEventFilterReason::UnlearnedGroupIdx
     );
+}
+
+#[derive(Debug)]
+struct CountingRawObserver(AtomicU32);
+
+impl RawKvEventObserver for CountingRawObserver {
+    fn observe(&self, _event: &RawKvEvent, _worker: WorkerWithDpRank) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn raw_observer_sees_valid_local_event_before_group_filtering() {
+    let raw_event: RawKvEvent =
+        from_slice(&block_removed_sequence(Some(1), None)).expect("valid raw event");
+    let observer = Arc::new(CountingRawObserver(AtomicU32::new(0)));
+    let mut normalizer = ZmqEventNormalizer::new(2).with_observer(observer.clone());
+
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(raw_event, WorkerWithDpRank::new(3, 0))
+            .unwrap_err(),
+        ZmqEventFilterReason::UnlearnedGroupIdx
+    );
+    assert_eq!(observer.0.load(Ordering::Relaxed), 1);
 }
 
 #[test]

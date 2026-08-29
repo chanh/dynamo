@@ -616,6 +616,11 @@ mod tests {
         };
         let worker = WorkerWithDpRank::new(7, 0);
         KvSourceMembershipView {
+            cache_evidence_barrier_enabled: HashMap::new(),
+            serving_incarnations: HashMap::new(),
+            cache_evidence_serving_incarnations: HashMap::new(),
+            cache_evidence_epoch_enabled: HashMap::new(),
+            cache_evidence_epoch_media: HashMap::new(),
             serving_endpoint: serving_endpoint.clone(),
             endpoint_resolution: KvStateEndpointResolution::Resolved(serving_endpoint),
             sources: HashMap::from([(worker, status)]),
@@ -650,6 +655,7 @@ mod tests {
                 kv_state_endpoint: missing.serving_endpoint.clone(),
                 worker,
                 publisher_id: 11,
+                evidence_incarnation_id: None,
                 recovery_target: None,
             }),
             Some(false),

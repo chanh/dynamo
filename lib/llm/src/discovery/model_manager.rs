@@ -2521,6 +2521,7 @@ mod tests {
             kv_state_endpoint: kv_endpoint.clone(),
             worker,
             publisher_id: 100,
+            evidence_incarnation_id: None,
             recovery_target: None,
         };
         discovery
