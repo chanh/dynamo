@@ -1328,6 +1328,10 @@ class WorkerFactory:
             needs_set.append(WorkerType.Encode)
         needs: list[list[WorkerType]] = [needs_set] if needs_set else []
 
+        handler.set_prompt_source_publisher(
+            await generate_endpoint.prompt_source_publisher()
+        )
+
         await self.register_vllm_model(
             model_input,
             model_type,

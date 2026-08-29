@@ -13,7 +13,7 @@ import struct
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import (
@@ -1108,6 +1108,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
     _benchmark_results: Optional[dict] = None
     _scale_ep_in_progress: bool = False
+    _PROMPT_SOURCE_ORIGIN_KEY = "dynamo-prompt-source-origin-router-id"
+    _PROMPT_SOURCE_REGISTRATION_NONCE_KEY = "dynamo-prompt-source-registration-nonce"
+    _PROMPT_SOURCE_ORIGIN_CAPACITY = 4096
+    _PROMPT_SOURCE_ORIGIN_TTL_S = 60.0
 
     @property
     def loaded_loras(self) -> dict[str, LoRAInfo]:
@@ -1180,6 +1184,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         # of calling engine_client.abort() during the unsafe pre-first-token
         # NIXL-KV-transfer window.
         self._deferred_aborts: dict[str, _DeferredAbort] = {}
+        self._prompt_source_publisher = None
+        self._prompt_source_active_origins: OrderedDict[str, tuple[int, int, float]] = (
+            OrderedDict()
+        )
+        self._prompt_source_pending_origins: OrderedDict[
+            str, tuple[int, int, float]
+        ] = OrderedDict()
+        self._prompt_source_outcome_unregister: Callable[[], None] | None = None
 
         self._multimodal_request_processor = VllmMultimodalRequestProcessor(
             model=config.model,
@@ -1221,6 +1233,139 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         # frees the encoder's GPU memory in the meantime. Ordering the encoder
         # after all other fallible setup removes that window by construction.
         self._load_custom_encoder(config)
+
+    def set_prompt_source_publisher(self, publisher: Any | None) -> None:
+        self._prompt_source_publisher = publisher
+        register = getattr(
+            self.engine_client, "register_prompt_source_outcome_callback", None
+        )
+        if publisher is not None and callable(register):
+            self._prompt_source_outcome_unregister = register(
+                self._publish_prompt_source_outcome
+            )
+
+    def _remember_prompt_source_origin(self, context: Context) -> None:
+        active_origins = getattr(self, "_prompt_source_active_origins", None)
+        if active_origins is None:
+            return
+        value = context.metadata.get(self._PROMPT_SOURCE_ORIGIN_KEY)
+        if value is None:
+            return
+        try:
+            origin_router_id = int(value)
+            registration_nonce = int(
+                context.metadata[self._PROMPT_SOURCE_REGISTRATION_NONCE_KEY]
+            )
+        except (TypeError, ValueError):
+            return
+        except KeyError:
+            return
+        if not (0 <= origin_router_id <= 2**64 - 1 and 0 < registration_nonce <= 2**64 - 1):
+            return
+        now = time.monotonic()
+        while len(active_origins) >= self._PROMPT_SOURCE_ORIGIN_CAPACITY:
+            active_origins.popitem(last=False)
+            self._observe_prompt_source_control_result("origin_active_evicted")
+        active_origins[context.id()] = (
+            origin_router_id,
+            registration_nonce,
+            now,
+        )
+
+    def _mark_prompt_source_cancelled(self, request_id: str) -> None:
+        active_origins = getattr(self, "_prompt_source_active_origins", None)
+        pending_origins = getattr(self, "_prompt_source_pending_origins", None)
+        if active_origins is None or pending_origins is None:
+            return
+        origin = active_origins.get(request_id)
+        if origin is None:
+            return
+        now = time.monotonic()
+        while pending_origins:
+            _, (_, _, inserted_at) = next(iter(pending_origins.items()))
+            if now - inserted_at < self._PROMPT_SOURCE_ORIGIN_TTL_S:
+                break
+            pending_origins.popitem(last=False)
+            self._observe_prompt_source_control_result("origin_pending_expired")
+        if len(pending_origins) >= self._PROMPT_SOURCE_ORIGIN_CAPACITY:
+            self._observe_prompt_source_control_result("origin_pending_full")
+            return
+        active_origins.pop(request_id, None)
+        pending_origins[request_id] = origin
+
+    def _finish_prompt_source_request(self, request_id: str) -> None:
+        active_origins = getattr(self, "_prompt_source_active_origins", None)
+        if active_origins is not None:
+            active_origins.pop(request_id, None)
+
+    def _observe_prompt_source_control_result(self, result: str) -> None:
+        publisher = getattr(self, "_prompt_source_publisher", None)
+        observe = getattr(publisher, "observe_control_result", None)
+        if callable(observe):
+            observe(result)
+
+    def _publish_prompt_source_outcome(self, outcome: Any) -> None:
+        publisher = getattr(self, "_prompt_source_publisher", None)
+        if publisher is None:
+            return
+        origin = self._prompt_source_pending_origins.pop(outcome.request_id, None)
+        if origin is None:
+            origin = self._prompt_source_active_origins.pop(outcome.request_id, None)
+        if origin is None:
+            self._observe_prompt_source_control_result("origin_missing")
+            return
+        origin_router_id, registration_nonce, _ = origin
+        complete = bool(outcome.complete)
+        local = getattr(outcome, "num_local_cached_tokens", None)
+        external = getattr(outcome, "num_external_cached_tokens", None)
+        computed = getattr(outcome, "num_computed_tokens", None)
+        external_lookup = getattr(outcome, "num_external_lookup_tokens", None)
+        retrieval_failure = getattr(
+            outcome, "num_external_retrieval_failure_tokens", None
+        )
+        missing_source_counts = complete and any(
+            value is None for value in (local, external, computed)
+        )
+        missing_lookup_counts = complete and any(
+            value is None for value in (external_lookup, retrieval_failure)
+        )
+        complete = complete and not missing_source_counts and not missing_lookup_counts
+        cache_source: dict[str, Any] = {
+            "schema_version": 1,
+            "complete": complete,
+            "prompt_tokens": int(outcome.num_prompt_tokens),
+        }
+        if complete:
+            cache_source.update(
+                gpu_hit_tokens=int(local),
+                cpu_hit_tokens=int(external),
+                cpu_lookup_tokens=int(external_lookup),
+                retrieval_failure_tokens=int(retrieval_failure),
+                recomputed_tokens=int(computed),
+            )
+        else:
+            if missing_source_counts:
+                reason = "cache_source_breakdown_unavailable"
+            elif missing_lookup_counts:
+                reason = "cache_source_lookup_breakdown_unavailable"
+            else:
+                reason = outcome.incomplete_reason
+            cache_source["incomplete_reason"] = reason
+        publisher.publish(
+            {
+                "origin_router_id": origin_router_id,
+                "request_id": outcome.request_id,
+                "registration_nonce": registration_nonce,
+                "cache_source": cache_source,
+                "num_computed_output_tokens": int(outcome.num_computed_output_tokens),
+                "num_unobserved_computed_output_tokens": int(
+                    outcome.num_unobserved_computed_output_tokens
+                ),
+                "generated_history_incomplete_reason": (
+                    outcome.generated_history_incomplete_reason
+                ),
+            }
+        )
 
     @functools.cached_property
     def _lora_enabled(self) -> bool:
@@ -1735,6 +1880,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         if not request_id:
             return {"status": "error", "message": "Missing 'request_id' in body"}
         try:
+            self._mark_prompt_source_cancelled(request_id)
             guard = self._deferred_aborts.get(request_id)
             if guard is not None:
                 # Route through the per-request deferred-abort guard so that in
@@ -2009,6 +2155,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             logger.debug(
                 f"Aborting {'Prefill ' if is_prefill else ''}Request ID: {request_id}"
             )
+            self._mark_prompt_source_cancelled(request_id)
 
             # Abort the request (via guard if provided, otherwise direct).
             if abort_guard is not None:
@@ -2718,6 +2865,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
     def cleanup(self):
         """Clean up resources including temporary directories."""
+        if self._prompt_source_outcome_unregister is not None:
+            self._prompt_source_outcome_unregister()
+            self._prompt_source_outcome_unregister = None
         if self._custom_encoder is not None:
             # Run backend.close() on the actor thread, then stop it — executor
             # GC would only end the thread, never call close().
@@ -3156,24 +3306,28 @@ class DecodeWorkerHandler(BaseWorkerHandler):
     async def generate(self, request, context):
         # Use context ID for request tracking and correlation
         request_id = context.id()
+        self._remember_prompt_source_origin(context)
         logger.debug(f"Decode Request ID: {request_id}")
         self._multimodal_request_processor.validate_multimodal_request(request)
         first_token = True
-        with time_and_log_code_section(
-            f"[DECODE] request: {request_id} generate"
-        ) as decode_timer:
-            if self.use_vllm_tokenizer:
-                # Text-in-text-out mode: use InputParamManager and OpenAI-compatible format
-                generator = self._generate_text_mode(request, context, request_id)
-            else:
-                # Token-in-token-out mode: internal protocol format
-                generator = self._generate_token_mode(request, context, request_id)
+        try:
+            with time_and_log_code_section(
+                f"[DECODE] request: {request_id} generate"
+            ) as decode_timer:
+                if self.use_vllm_tokenizer:
+                    # Text-in-text-out mode: use InputParamManager and OpenAI-compatible format
+                    generator = self._generate_text_mode(request, context, request_id)
+                else:
+                    # Token-in-token-out mode: internal protocol format
+                    generator = self._generate_token_mode(request, context, request_id)
 
-            async for chunk in _translate_vllm_client_errors(generator):
-                if first_token:
-                    decode_timer.stop_interval()
-                    first_token = False
-                yield chunk
+                async for chunk in _translate_vllm_client_errors(generator):
+                    if first_token:
+                        decode_timer.stop_interval()
+                        first_token = False
+                    yield chunk
+        finally:
+            self._finish_prompt_source_request(request_id)
 
     async def _assemble_custom_encoder_prompt(
         self,

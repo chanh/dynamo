@@ -1963,3 +1963,237 @@ class TestRLAdminRouteHardening:
         await guard.abort()
         assert len(escalated) == 1
         assert isinstance(escalated[0], EngineDeadError)
+
+
+def test_terminal_prompt_source_outcome_carries_origin_without_payload():
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    publisher = MagicMock()
+    handler._prompt_source_publisher = publisher
+    handler._prompt_source_active_origins = mod.OrderedDict()
+    handler._prompt_source_pending_origins = mod.OrderedDict(
+        [("request-1", (17, 23, mod.time.monotonic()))]
+    )
+    outcome = SimpleNamespace(
+        request_id="request-1",
+        complete=True,
+        num_prompt_tokens=100,
+        num_local_cached_tokens=20,
+        num_external_cached_tokens=30,
+        num_external_lookup_tokens=35,
+        num_external_retrieval_failure_tokens=5,
+        num_computed_tokens=50,
+        incomplete_reason=None,
+        num_computed_output_tokens=7,
+        num_unobserved_computed_output_tokens=1,
+        generated_history_incomplete_reason=(
+            "computed_output_identity_unavailable_after_abort"
+        ),
+    )
+
+    handler._publish_prompt_source_outcome(outcome)
+
+    payload = publisher.publish.call_args.args[0]
+    assert payload["origin_router_id"] == 17
+    assert payload["request_id"] == "request-1"
+    assert payload["registration_nonce"] == 23
+    assert payload["cache_source"]["gpu_hit_tokens"] == 20
+    assert payload["num_computed_output_tokens"] == 7
+    assert "token_ids" not in payload
+    assert "prompt" not in payload
+    assert "request-1" not in handler._prompt_source_pending_origins
+
+
+def test_terminal_prompt_source_origin_registry_is_bounded():
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    handler._prompt_source_publisher = None
+    handler._prompt_source_active_origins = mod.OrderedDict()
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+    handler._PROMPT_SOURCE_ORIGIN_CAPACITY = 2
+    handler._PROMPT_SOURCE_ORIGIN_TTL_S = 60.0
+
+    for request_id in ("one", "two", "three"):
+        context = MagicMock()
+        context.id.return_value = request_id
+        context.metadata = {
+            handler._PROMPT_SOURCE_ORIGIN_KEY: "9",
+            handler._PROMPT_SOURCE_REGISTRATION_NONCE_KEY: "11",
+        }
+        handler._remember_prompt_source_origin(context)
+
+    assert list(handler._prompt_source_active_origins) == ["two", "three"]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"dynamo-prompt-source-origin-router-id": "9"},
+        {
+            "dynamo-prompt-source-origin-router-id": "-1",
+            "dynamo-prompt-source-registration-nonce": "11",
+        },
+        {
+            "dynamo-prompt-source-origin-router-id": str(2**64),
+            "dynamo-prompt-source-registration-nonce": "11",
+        },
+        {
+            "dynamo-prompt-source-origin-router-id": "9",
+            "dynamo-prompt-source-registration-nonce": "0",
+        },
+        {
+            "dynamo-prompt-source-origin-router-id": "9",
+            "dynamo-prompt-source-registration-nonce": str(2**64),
+        },
+    ],
+)
+def test_terminal_prompt_source_origin_requires_current_u64_nonce(metadata):
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    handler._prompt_source_publisher = MagicMock()
+    handler._prompt_source_active_origins = mod.OrderedDict()
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+    context = MagicMock()
+    context.id.return_value = "request-1"
+    context.metadata = metadata
+
+    handler._remember_prompt_source_origin(context)
+
+    assert not handler._prompt_source_active_origins
+
+
+def test_prompt_source_control_result_uses_standalone_publisher_api():
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    handler._prompt_source_publisher = MagicMock()
+
+    handler._observe_prompt_source_control_result("origin_missing")
+
+    handler._prompt_source_publisher.observe_control_result.assert_called_once_with(
+        "origin_missing"
+    )
+
+
+def test_normal_completion_removes_active_origin_without_touching_cancelled():
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    handler._prompt_source_publisher = None
+    now = mod.time.monotonic()
+    handler._prompt_source_active_origins = mod.OrderedDict([("normal", (9, 11, now))])
+    handler._prompt_source_pending_origins = mod.OrderedDict(
+        [("cancelled", (9, 11, now))]
+    )
+
+    handler._finish_prompt_source_request("normal")
+
+    assert not handler._prompt_source_active_origins
+    assert list(handler._prompt_source_pending_origins) == ["cancelled"]
+
+
+def test_many_normal_completions_do_not_evict_cancelled_origin():
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    handler._prompt_source_publisher = None
+    handler._prompt_source_active_origins = mod.OrderedDict()
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+    handler._PROMPT_SOURCE_ORIGIN_CAPACITY = 2
+    handler._PROMPT_SOURCE_ORIGIN_TTL_S = 60.0
+    now = mod.time.monotonic()
+    handler._prompt_source_pending_origins["cancelled"] = (9, 11, now)
+
+    for index in range(10):
+        request_id = f"normal-{index}"
+        context = MagicMock()
+        context.id.return_value = request_id
+        context.metadata = {
+            handler._PROMPT_SOURCE_ORIGIN_KEY: "9",
+            handler._PROMPT_SOURCE_REGISTRATION_NONCE_KEY: "11",
+        }
+        handler._remember_prompt_source_origin(context)
+        handler._finish_prompt_source_request(request_id)
+
+    assert list(handler._prompt_source_pending_origins) == ["cancelled"]
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["num_external_lookup_tokens", "num_external_retrieval_failure_tokens"],
+)
+def test_terminal_prompt_source_missing_lookup_is_explicitly_incomplete(
+    missing_field,
+):
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    publisher = MagicMock()
+    handler._prompt_source_publisher = publisher
+    handler._prompt_source_active_origins = mod.OrderedDict()
+    handler._prompt_source_pending_origins = mod.OrderedDict(
+        [("request-1", (17, 23, mod.time.monotonic()))]
+    )
+    outcome = {
+        "request_id": "request-1",
+        "complete": True,
+        "num_prompt_tokens": 100,
+        "num_local_cached_tokens": 20,
+        "num_external_cached_tokens": 30,
+        "num_external_lookup_tokens": 35,
+        "num_external_retrieval_failure_tokens": 5,
+        "num_computed_tokens": 50,
+        "incomplete_reason": None,
+        "num_computed_output_tokens": 7,
+        "num_unobserved_computed_output_tokens": 1,
+        "generated_history_incomplete_reason": None,
+    }
+    del outcome[missing_field]
+
+    handler._publish_prompt_source_outcome(SimpleNamespace(**outcome))
+
+    payload = publisher.publish.call_args.args[0]
+    assert payload["cache_source"] == {
+        "schema_version": 1,
+        "complete": False,
+        "prompt_tokens": 100,
+        "incomplete_reason": "cache_source_lookup_breakdown_unavailable",
+    }
+
+
+def test_terminal_prompt_source_payload_json_round_trip_matches_rust_contract():
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    publisher = MagicMock()
+    handler._prompt_source_publisher = publisher
+    handler._prompt_source_active_origins = mod.OrderedDict(
+        [("request-1", (2**64 - 1, 2**64 - 1, mod.time.monotonic()))]
+    )
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+    outcome = SimpleNamespace(
+        request_id="request-1",
+        complete=True,
+        num_prompt_tokens=100,
+        num_local_cached_tokens=20,
+        num_external_cached_tokens=30,
+        num_external_lookup_tokens=35,
+        num_external_retrieval_failure_tokens=5,
+        num_computed_tokens=50,
+        incomplete_reason=None,
+        num_computed_output_tokens=7,
+        num_unobserved_computed_output_tokens=1,
+        generated_history_incomplete_reason=None,
+    )
+
+    handler._publish_prompt_source_outcome(outcome)
+    payload = publisher.publish.call_args.args[0]
+    decoded = json.loads(json.dumps(payload))
+
+    assert decoded == payload
+    assert set(decoded) == {
+        "origin_router_id",
+        "request_id",
+        "registration_nonce",
+        "cache_source",
+        "num_computed_output_tokens",
+        "num_unobserved_computed_output_tokens",
+        "generated_history_incomplete_reason",
+    }
+    assert decoded["cache_source"] == {
+        "schema_version": 1,
+        "complete": True,
+        "prompt_tokens": 100,
+        "gpu_hit_tokens": 20,
+        "cpu_hit_tokens": 30,
+        "cpu_lookup_tokens": 35,
+        "retrieval_failure_tokens": 5,
+        "recomputed_tokens": 50,
+    }
