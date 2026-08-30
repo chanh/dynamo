@@ -43,6 +43,19 @@ enum EvidenceHashMapping {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvidenceLookaheadMapping {
+    parent_external_hash: Option<u64>,
+    sequence_hash: u64,
+    block: CacheEvidenceStoredBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceLookaheadMappingState {
+    Known(EvidenceLookaheadMapping),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvidenceMutationError {
     Invalid,
     UnresolvedHash,
@@ -67,6 +80,7 @@ struct EvidenceHashResolver {
     // one source, so the owner remains part of the identity fence. External
     // block hashes are scoped to a cache group and may repeat across groups.
     mappings: HashMap<(CacheOwner, u32, u64), EvidenceHashMapping>,
+    lookahead_mappings: HashMap<(CacheOwner, u32, u64), EvidenceLookaheadMappingState>,
     capacity: usize,
 }
 
@@ -74,16 +88,20 @@ impl EvidenceHashResolver {
     fn new(capacity: usize) -> Self {
         Self {
             mappings: HashMap::new(),
+            lookahead_mappings: HashMap::new(),
             capacity,
         }
     }
 
     fn clear(&mut self) {
         self.mappings.clear();
+        self.lookahead_mappings.clear();
     }
 
     fn clear_owner(&mut self, owner: CacheOwner) {
         self.mappings
+            .retain(|(mapped_owner, _, _), _| *mapped_owner != owner);
+        self.lookahead_mappings
             .retain(|(mapped_owner, _, _), _| *mapped_owner != owner);
     }
 
@@ -123,7 +141,13 @@ impl EvidenceHashResolver {
                 .iter()
                 .filter(|key| !self.mappings.contains_key(key))
                 .count();
-            if self.mappings.len().saturating_add(new_ambiguous) > self.capacity {
+            if self
+                .mappings
+                .len()
+                .saturating_add(self.lookahead_mappings.len())
+                .saturating_add(new_ambiguous)
+                > self.capacity
+            {
                 return Err(EvidenceMutationError::MappingOverflow);
             }
             for key in ambiguous {
@@ -136,7 +160,13 @@ impl EvidenceHashResolver {
             .keys()
             .filter(|key| !self.mappings.contains_key(key))
             .count();
-        if self.mappings.len().saturating_add(new_entries) > self.capacity {
+        if self
+            .mappings
+            .len()
+            .saturating_add(self.lookahead_mappings.len())
+            .saturating_add(new_entries)
+            > self.capacity
+        {
             return Err(EvidenceMutationError::MappingOverflow);
         }
 
@@ -146,6 +176,53 @@ impl EvidenceHashResolver {
                 .or_insert(EvidenceHashMapping::Known(block));
         }
         Ok(())
+    }
+
+    fn learn_gpu_lookahead(
+        &mut self,
+        owner: CacheOwner,
+        group: u32,
+        mapping: EvidenceLookaheadMapping,
+    ) -> Result<(), EvidenceMutationError> {
+        let key = (owner, group, mapping.block.external_hash);
+        match self.lookahead_mappings.get(&key) {
+            Some(EvidenceLookaheadMappingState::Known(known)) if *known == mapping => {
+                return Ok(());
+            }
+            Some(_) => {
+                self.lookahead_mappings
+                    .insert(key, EvidenceLookaheadMappingState::Ambiguous);
+                return Err(EvidenceMutationError::AmbiguousHash);
+            }
+            None => {}
+        }
+        if !self.lookahead_mappings.contains_key(&key)
+            && self
+                .mappings
+                .len()
+                .saturating_add(self.lookahead_mappings.len())
+                .saturating_add(1)
+                > self.capacity
+        {
+            return Err(EvidenceMutationError::MappingOverflow);
+        }
+        self.lookahead_mappings
+            .insert(key, EvidenceLookaheadMappingState::Known(mapping));
+        Ok(())
+    }
+
+    fn resolve_cpu_lookahead(
+        &self,
+        owner: CacheOwner,
+        group: u32,
+        external_hash: u64,
+    ) -> Option<EvidenceLookaheadMapping> {
+        self.lookahead_mappings
+            .get(&(owner, group, external_hash))
+            .and_then(|mapping| match mapping {
+                EvidenceLookaheadMappingState::Known(mapping) => Some(*mapping),
+                EvidenceLookaheadMappingState::Ambiguous => None,
+            })
     }
 
     fn resolve_cpu(
@@ -561,6 +638,9 @@ fn cache_evidence_mutation_with_resolver(
             parent_block_hash,
             parent_sequence_hash,
             parent_sequence_hash_algorithm,
+            eagle_lookahead_sequence_hash,
+            eagle_lookahead_sequence_hash_algorithm,
+            eagle_lookahead_token_ids,
             token_ids,
             block_size,
             medium,
@@ -571,6 +651,17 @@ fn cache_evidence_mutation_with_resolver(
             group_idx,
             ..
         } => {
+            let eagle_lookahead = match (
+                eagle_lookahead_sequence_hash,
+                eagle_lookahead_sequence_hash_algorithm.as_deref(),
+                eagle_lookahead_token_ids.as_deref(),
+            ) {
+                (None, None, None) => None,
+                (Some(sequence), Some(PARENT_SEQUENCE_HASH_ALGORITHM), Some(tokens)) => {
+                    Some((sequence.into_u64(), tokens))
+                }
+                _ => return Err(EvidenceMutationError::Invalid),
+            };
             let parent_sequence_hash = match (
                 parent_sequence_hash,
                 parent_sequence_hash_algorithm.as_deref(),
@@ -588,10 +679,75 @@ fn cache_evidence_mutation_with_resolver(
                 .map(BlockHashValue::into_u64)
                 .collect();
             let store_tier = tier(medium.as_deref())?;
+            if let Some((sequence_hash, lookahead_tokens)) = eagle_lookahead {
+                if parent_sequence_hash.is_some()
+                    || !token_ids.is_empty()
+                    || block_hashes.len() != 1
+                    || *block_size == 0
+                    || lookahead_tokens.len() != *block_size
+                    || *is_eagle != Some(false)
+                    || block_mm_infos.is_some()
+                {
+                    return Err(EvidenceMutationError::Invalid);
+                }
+                let [stored] = create_stored_blocks(
+                    (*block_size)
+                        .try_into()
+                        .map_err(|_| EvidenceMutationError::Invalid)?,
+                    lookahead_tokens,
+                    &[*block_size as u64],
+                    &external_hashes,
+                    lora_name.as_deref(),
+                    cache_namespace.as_deref(),
+                    warning_count,
+                    block_mm_infos.as_deref(),
+                    Some(false),
+                    image_token_id,
+                )
+                .try_into()
+                .map_err(|_| EvidenceMutationError::Invalid)?;
+                let mapping = EvidenceLookaheadMapping {
+                    parent_external_hash: parent_block_hash.map(BlockHashValue::into_u64),
+                    sequence_hash,
+                    block: CacheEvidenceStoredBlock {
+                        external_hash: stored.block_hash.0,
+                        tokens_hash: stored.tokens_hash.0,
+                    },
+                };
+                if store_tier == CacheTier::Gpu {
+                    resolver.learn_gpu_lookahead(
+                        owner,
+                        group_idx.ok_or(EvidenceMutationError::Invalid)?,
+                        mapping,
+                    )?;
+                }
+                return Ok(Some(CacheEvidenceMutation::StoreEagleLookahead {
+                    tier: store_tier,
+                    group_idx: group_idx.ok_or(EvidenceMutationError::Invalid)?,
+                    parent_external_hash: mapping.parent_external_hash,
+                    sequence_hash: mapping.sequence_hash,
+                    block: mapping.block,
+                }));
+            }
             let stored = if store_tier == CacheTier::Cpu && token_ids.is_empty() && *block_size == 0
             {
                 let group = group_idx.ok_or(EvidenceMutationError::Invalid)?;
-                resolver.resolve_cpu(owner, group, &external_hashes)?
+                match resolver.resolve_cpu(owner, group, &external_hashes) {
+                    Ok(stored) => stored,
+                    Err(EvidenceMutationError::UnresolvedHash) if external_hashes.len() == 1 => {
+                        let mapping = resolver
+                            .resolve_cpu_lookahead(owner, group, external_hashes[0])
+                            .ok_or(EvidenceMutationError::UnresolvedHash)?;
+                        return Ok(Some(CacheEvidenceMutation::StoreEagleLookahead {
+                            tier: CacheTier::Cpu,
+                            group_idx: group,
+                            parent_external_hash: mapping.parent_external_hash,
+                            sequence_hash: mapping.sequence_hash,
+                            block: mapping.block,
+                        }));
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 let num_block_tokens = vec![*block_size as u64; external_hashes.len()];
                 let stored = create_stored_blocks(
@@ -704,6 +860,9 @@ mod tests {
             parent_block_hash: parent_block_hash.map(BlockHashValue::Unsigned),
             parent_sequence_hash: None,
             parent_sequence_hash_algorithm: None,
+            eagle_lookahead_sequence_hash: None,
+            eagle_lookahead_sequence_hash_algorithm: None,
+            eagle_lookahead_token_ids: None,
             token_ids: token_ids.to_vec(),
             block_size,
             medium: Some("CPU".to_string()),
@@ -737,6 +896,9 @@ mod tests {
             parent_block_hash: None,
             parent_sequence_hash: None,
             parent_sequence_hash_algorithm: None,
+            eagle_lookahead_sequence_hash: None,
+            eagle_lookahead_sequence_hash_algorithm: None,
+            eagle_lookahead_token_ids: None,
             token_ids,
             block_size,
             medium: Some(medium.to_string()),
@@ -1056,6 +1218,9 @@ mod tests {
             parent_block_hash: None,
             parent_sequence_hash: None,
             parent_sequence_hash_algorithm: None,
+            eagle_lookahead_sequence_hash: None,
+            eagle_lookahead_sequence_hash_algorithm: None,
+            eagle_lookahead_token_ids: None,
             token_ids: vec![1; 8],
             block_size: 8,
             medium: None,
@@ -1384,6 +1549,289 @@ mod tests {
     }
 
     #[test]
+    fn terminal_eagle_wire_matches_native_hybrid_prefix() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let fixtures = [
+            (
+                575usize,
+                include_str!("fixtures/terminal_eagle_575.msgpack.b64"),
+                "d2864f80d685d8962a7e4ff68614693839f811b9851157cd4c1e8fbf24e41a40",
+                KnownPrefixLength::Known(0),
+                [2usize, 2, 2, 2, 16],
+            ),
+            (
+                576usize,
+                include_str!("fixtures/terminal_eagle_576.msgpack.b64"),
+                "1b2f5947ae3976f7a61a1fc19ade43308559c02660821b003a2703ff3c8e45dd",
+                KnownPrefixLength::Known(0),
+                [2usize, 3, 3, 2, 16],
+            ),
+            (
+                577usize,
+                include_str!("fixtures/terminal_eagle_577.msgpack.b64"),
+                "dc6cd99a4a13d6a14c1c66c6f04b82a95f3686eb8dae45fea76ec3d97e210dfc",
+                KnownPrefixLength::Known(512),
+                [2usize, 3, 3, 2, 16],
+            ),
+        ];
+
+        for (num_tokens, encoded, expected_digest, expected_prefix, expected_blocks) in fixtures {
+            let wire = base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .unwrap();
+            assert_eq!(format!("{:x}", Sha256::digest(&wire)), expected_digest);
+            let batch: KvEventBatch = rmp_serde::from_slice(&wire).unwrap();
+
+            let mut blocks_by_group = [0usize; 5];
+            for event in &batch.events {
+                let RawKvEvent::BlockStored {
+                    block_hashes,
+                    group_idx: Some(group_idx),
+                    ..
+                } = event
+                else {
+                    panic!("unexpected terminal EAGLE fixture event: {event:?}");
+                };
+                blocks_by_group[*group_idx as usize] += block_hashes.len();
+            }
+            assert_eq!(blocks_by_group, expected_blocks);
+            let lookahead_events: Vec<_> = batch
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        RawKvEvent::BlockStored {
+                            eagle_lookahead_token_ids: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .collect();
+            assert_eq!(lookahead_events.len(), usize::from(num_tokens == 576));
+            if num_tokens == 576 {
+                let RawKvEvent::BlockStored {
+                    token_ids,
+                    is_eagle,
+                    eagle_lookahead_sequence_hash: Some(_),
+                    eagle_lookahead_sequence_hash_algorithm: Some(algorithm),
+                    eagle_lookahead_token_ids: Some(lookahead_tokens),
+                    ..
+                } = lookahead_events[0]
+                else {
+                    panic!("missing exact terminal EAGLE lookahead event");
+                };
+                assert!(token_ids.is_empty());
+                assert_eq!(*is_eagle, Some(false));
+                assert_eq!(algorithm, PARENT_SEQUENCE_HASH_ALGORITHM);
+                assert_eq!(lookahead_tokens.len(), 64);
+
+                let mut legacy_view = (*lookahead_events[0]).clone();
+                let RawKvEvent::BlockStored {
+                    eagle_lookahead_sequence_hash,
+                    eagle_lookahead_sequence_hash_algorithm,
+                    eagle_lookahead_token_ids,
+                    ..
+                } = &mut legacy_view
+                else {
+                    unreachable!();
+                };
+                *eagle_lookahead_sequence_hash = None;
+                *eagle_lookahead_sequence_hash_algorithm = None;
+                *eagle_lookahead_token_ids = None;
+                let mut legacy_resolver = EvidenceHashResolver::new(MAX_EVIDENCE_HASH_MAPPINGS);
+                let legacy_warning_count = Arc::new(AtomicU32::new(0));
+                assert_eq!(
+                    cache_evidence_mutation_with_resolver(
+                        &legacy_view,
+                        TEST_OWNER,
+                        None,
+                        &legacy_warning_count,
+                        &mut legacy_resolver,
+                    ),
+                    Err(EvidenceMutationError::Invalid)
+                );
+            }
+
+            let warning_count = Arc::new(AtomicU32::new(0));
+            let mut resolver = EvidenceHashResolver::new(MAX_EVIDENCE_HASH_MAPPINGS);
+            let mutations = batch
+                .events
+                .iter()
+                .map(|event| {
+                    cache_evidence_mutation_with_resolver(
+                        event,
+                        TEST_OWNER,
+                        None,
+                        &warning_count,
+                        &mut resolver,
+                    )
+                    .unwrap()
+                    .unwrap()
+                })
+                .collect();
+            let mut ledger = CacheEvidenceLedger::new(4096);
+            ledger.record_group_catalog(TEST_OWNER, CacheTier::Gpu, 0..5);
+            ledger.seal_physical_scope();
+            let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+                owner: TEST_OWNER,
+                source_cursor: 1,
+                source_incarnation_id: None,
+                heartbeat: false,
+                watermark_source_cursor: None,
+                mutations,
+                barrier_id: None,
+                epoch_id: None,
+                telemetry_complete: true,
+            });
+            assert!(result.is_complete());
+
+            let tokens: Vec<u32> = (0..num_tokens)
+                .map(|index| 100 + (index % 2) as u32)
+                .collect();
+            let specs = [
+                (0, CacheGroupKind::FullAttention, 256, None, false),
+                (1, CacheGroupKind::SlidingWindow, 64, Some(128), false),
+                (2, CacheGroupKind::SlidingWindow, 64, Some(128), true),
+                (3, CacheGroupKind::SlidingWindow, 4, Some(8), false),
+                (4, CacheGroupKind::SlidingWindow, 8, Some(128), false),
+            ];
+            let groups: Vec<_> = specs
+                .into_iter()
+                .map(|(group_idx, kind, block_size, sliding_window, is_eagle)| {
+                    let sequence_hashes = TokensWithHashes::new(tokens.clone(), block_size)
+                        .with_lora_name("terminal-eagle-lora".to_string())
+                        .with_cache_namespace("terminal-eagle-salt".to_string())
+                        .with_is_eagle(is_eagle)
+                        .get_or_compute_seq_hashes()
+                        .to_vec();
+                    let eagle_lookahead_block_hashes = if is_eagle {
+                        TokensWithHashes::new(tokens.clone(), block_size)
+                            .with_lora_name("terminal-eagle-lora".to_string())
+                            .with_cache_namespace("terminal-eagle-salt".to_string())
+                            .get_or_compute_block_hashes()
+                            .iter()
+                            .map(|hash| hash.0)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    CacheGroupHashSequence {
+                        group_idx,
+                        kind,
+                        block_size,
+                        sliding_window,
+                        is_eagle,
+                        alignment_tokens: 256,
+                        sequence_hashes,
+                        eagle_lookahead_block_hashes,
+                    }
+                })
+                .collect();
+            assert_eq!(
+                ledger.resident_prefix_on(&groups, num_tokens as u64, TEST_OWNER),
+                expected_prefix
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_eagle_n576_wire_matches_cross_request_n577_native_hit() {
+        use base64::Engine as _;
+
+        let wire = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("fixtures/terminal_eagle_576.msgpack.b64").trim())
+            .unwrap();
+        let batch: KvEventBatch = rmp_serde::from_slice(&wire).unwrap();
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let mut resolver = EvidenceHashResolver::new(MAX_EVIDENCE_HASH_MAPPINGS);
+        let mutations = batch
+            .events
+            .iter()
+            .map(|event| {
+                cache_evidence_mutation_with_resolver(
+                    event,
+                    TEST_OWNER,
+                    None,
+                    &warning_count,
+                    &mut resolver,
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect();
+        let mut ledger = CacheEvidenceLedger::new(4096);
+        ledger.record_group_catalog(TEST_OWNER, CacheTier::Gpu, 0..5);
+        ledger.seal_physical_scope();
+        assert!(
+            ledger
+                .apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+                    owner: TEST_OWNER,
+                    source_cursor: 1,
+                    source_incarnation_id: None,
+                    heartbeat: false,
+                    watermark_source_cursor: None,
+                    mutations,
+                    barrier_id: None,
+                    epoch_id: None,
+                    telemetry_complete: true,
+                })
+                .is_complete()
+        );
+
+        let tokens: Vec<u32> = (0..577).map(|index| 100 + (index % 2) as u32).collect();
+        let specs = [
+            (0, CacheGroupKind::FullAttention, 256, None, false),
+            (1, CacheGroupKind::SlidingWindow, 64, Some(128), false),
+            (2, CacheGroupKind::SlidingWindow, 64, Some(128), true),
+            (3, CacheGroupKind::SlidingWindow, 4, Some(8), false),
+            (4, CacheGroupKind::SlidingWindow, 8, Some(128), false),
+        ];
+        let groups: Vec<_> = specs
+            .into_iter()
+            .map(|(group_idx, kind, block_size, sliding_window, is_eagle)| {
+                let sequence_hashes = TokensWithHashes::new(tokens.clone(), block_size)
+                    .with_lora_name("terminal-eagle-lora".to_string())
+                    .with_cache_namespace("terminal-eagle-salt".to_string())
+                    .with_is_eagle(is_eagle)
+                    .get_or_compute_seq_hashes()
+                    .to_vec();
+                let eagle_lookahead_block_hashes = if is_eagle {
+                    TokensWithHashes::new(tokens.clone(), block_size)
+                        .with_lora_name("terminal-eagle-lora".to_string())
+                        .with_cache_namespace("terminal-eagle-salt".to_string())
+                        .get_or_compute_block_hashes()
+                        .iter()
+                        .map(|hash| hash.0)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                CacheGroupHashSequence {
+                    group_idx,
+                    kind,
+                    block_size,
+                    sliding_window,
+                    is_eagle,
+                    alignment_tokens: 256,
+                    sequence_hashes,
+                    eagle_lookahead_block_hashes,
+                }
+            })
+            .collect();
+
+        // Exact vLLM returns 512 for this cross-request transition. The marker
+        // qualifies the preceding canonical EAGLE prefix without advertising
+        // the nonexistent B+1 canonical terminal unit.
+        assert_eq!(
+            ledger.resident_prefix_on(&groups, 577, TEST_OWNER),
+            KnownPrefixLength::Known(512)
+        );
+    }
+
+    #[test]
     fn constituent_events_preserve_hybrid_prefix_and_duplicate_refcounts() {
         const HBF: usize = 3;
         const FULL_BLOCK_SIZE: usize = 256;
@@ -1472,6 +1920,7 @@ mod tests {
             is_eagle: false,
             alignment_tokens: FULL_BLOCK_SIZE as u32,
             sequence_hashes: changed_full_hashes,
+            eagle_lookahead_block_hashes: Vec::new(),
         };
         let original_swa_hashes = sequence_hashes(&original_tokens, SWA_BLOCK_SIZE as u32);
         let changed_swa_hashes = sequence_hashes(&changed_tail, SWA_BLOCK_SIZE as u32);
@@ -1485,6 +1934,7 @@ mod tests {
             is_eagle: false,
             alignment_tokens: FULL_BLOCK_SIZE as u32,
             sequence_hashes: changed_swa_hashes,
+            eagle_lookahead_block_hashes: Vec::new(),
         };
 
         assert_eq!(

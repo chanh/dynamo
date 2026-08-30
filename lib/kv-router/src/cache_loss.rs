@@ -38,6 +38,7 @@ pub enum CacheEvidenceApplyIntegrityFailure {
     MissingGroup,
     MissingParent,
     ConflictingMapping,
+    MappingCapacity,
 }
 
 impl CacheEvidenceApplyIntegrityFailure {
@@ -47,6 +48,7 @@ impl CacheEvidenceApplyIntegrityFailure {
             Self::MissingGroup => "missing_group",
             Self::MissingParent => "missing_parent",
             Self::ConflictingMapping => "conflicting_mapping",
+            Self::MappingCapacity => "mapping_capacity",
         }
     }
 }
@@ -81,6 +83,13 @@ pub enum CacheEvidenceMutation {
         parent_external_hash: u64,
         parent_sequence_hash: u64,
         blocks: Vec<CacheEvidenceStoredBlock>,
+    },
+    StoreEagleLookahead {
+        tier: CacheTier,
+        group_idx: u32,
+        parent_external_hash: Option<u64>,
+        sequence_hash: u64,
+        block: CacheEvidenceStoredBlock,
     },
     Remove {
         tier: CacheTier,
@@ -125,6 +134,7 @@ impl CacheEvidenceMutation {
                 blocks,
             )),
             Self::Remove { .. } | Self::Clear { .. } => None,
+            Self::StoreEagleLookahead { .. } => None,
         }
     }
 }
@@ -161,6 +171,9 @@ pub struct CacheGroupHashSequence {
     pub is_eagle: bool,
     pub alignment_tokens: u32,
     pub sequence_hashes: Vec<u64>,
+    /// Ordinary B-token hashes aligned with EAGLE sequence hashes. Entry i
+    /// identifies the physical lookahead block that can qualify prefix i-1.
+    pub eagle_lookahead_block_hashes: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,12 +232,22 @@ struct PhysicalCopy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhysicalExternalEntry {
+    refs: u32,
+    normal_sequence_hash: Option<u64>,
+    eagle_lookahead: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreMutationResult {
     Applied,
     MissingParent,
     Invalid,
     RejectedMapping,
+    Capacity,
 }
+
+const MAX_PHYSICAL_EVIDENCE_MAPPINGS: usize = 4_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParentSequenceLookup {
@@ -247,7 +270,11 @@ pub struct CacheEvidenceLedger {
     history_complete: bool,
     history_epoch: u64,
     copies: HashMap<(u64, PhysicalCopy), u32>,
-    external_copies: HashMap<(u64, PhysicalCopy), (u64, u32)>,
+    physical_external_entries: HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
+    physical_capacity: usize,
+    gpu_physical_blocks: usize,
+    cpu_physical_blocks: usize,
+    eagle_lookahead_copies: HashMap<(u64, u64, PhysicalCopy), u32>,
     seen_external_hashes: HashSet<(CacheOwner, u32, u64)>,
     sampled_missing_parent_keys: HashSet<(CacheOwner, u32)>,
     required_groups: HashMap<(CacheOwner, CacheTier), BTreeSet<u32>>,
@@ -270,7 +297,11 @@ impl CacheEvidenceLedger {
             history_complete: false,
             history_epoch: 0,
             copies: HashMap::new(),
-            external_copies: HashMap::new(),
+            physical_external_entries: HashMap::new(),
+            physical_capacity: MAX_PHYSICAL_EVIDENCE_MAPPINGS,
+            gpu_physical_blocks: 0,
+            cpu_physical_blocks: 0,
+            eagle_lookahead_copies: HashMap::new(),
             seen_external_hashes: HashSet::with_capacity(history_capacity),
             sampled_missing_parent_keys: HashSet::new(),
             required_groups: HashMap::new(),
@@ -328,7 +359,7 @@ impl CacheEvidenceLedger {
                 .keys()
                 .any(|(_, copy)| owners.contains(&copy.owner))
             || self
-                .external_copies
+                .physical_external_entries
                 .keys()
                 .any(|(_, copy)| owners.contains(&copy.owner))
         {
@@ -406,20 +437,12 @@ impl CacheEvidenceLedger {
     }
 
     pub fn stats(&self) -> CacheEvidenceStats {
-        let mut gpu_physical_blocks = 0;
-        let mut cpu_physical_blocks = 0;
-        for (_, copy) in self.external_copies.keys() {
-            match copy.tier {
-                CacheTier::Gpu => gpu_physical_blocks += 1,
-                CacheTier::Cpu => cpu_physical_blocks += 1,
-            }
-        }
         CacheEvidenceStats {
             history_blocks: self.seen_blocks.len(),
             history_saturated: self.history_saturated,
             history_complete: self.history_complete,
-            gpu_physical_blocks,
-            cpu_physical_blocks,
+            gpu_physical_blocks: self.gpu_physical_blocks,
+            cpu_physical_blocks: self.cpu_physical_blocks,
             expected_owners: self.expected_owners.as_ref().map_or(0, HashSet::len),
             cataloged_owners: self
                 .required_groups
@@ -459,7 +482,9 @@ impl CacheEvidenceLedger {
 
         let mut store_run_start = None;
         for (index, mutation) in batch.mutations.iter().enumerate() {
-            if mutation.store_parts().is_some() {
+            if mutation.store_parts().is_some()
+                || matches!(mutation, CacheEvidenceMutation::StoreEagleLookahead { .. })
+            {
                 store_run_start.get_or_insert(index);
                 continue;
             }
@@ -468,7 +493,8 @@ impl CacheEvidenceLedger {
             }
             match mutation {
                 CacheEvidenceMutation::Store { .. }
-                | CacheEvidenceMutation::StoreWithParentAttestation { .. } => {
+                | CacheEvidenceMutation::StoreWithParentAttestation { .. }
+                | CacheEvidenceMutation::StoreEagleLookahead { .. } => {
                     unreachable!("stores were handled above")
                 }
                 CacheEvidenceMutation::Remove {
@@ -518,18 +544,30 @@ impl CacheEvidenceLedger {
                     Ok(parent) => parent,
                     Err(_) => return HashSet::new(),
                 };
-            return blocks
-                .iter()
-                .map(|block| {
-                    let hash = parent.map_or(block.tokens_hash, |parent| {
-                        compute_next_seq_hash(parent, LocalBlockHash(block.tokens_hash))
-                    });
-                    parent = Some(hash);
-                    hash
-                })
-                .collect();
+            let mut affected = HashSet::new();
+            for block in blocks {
+                let hash = parent.map_or(block.tokens_hash, |parent| {
+                    compute_next_seq_hash(parent, LocalBlockHash(block.tokens_hash))
+                });
+                parent = Some(hash);
+                affected.insert(hash);
+                for tier in [CacheTier::Gpu, CacheTier::Cpu] {
+                    let key = (block.external_hash, PhysicalCopy { owner, tier, group });
+                    if let Some((sequence_hash, _)) = self
+                        .physical_external_entries
+                        .get(&key)
+                        .and_then(|entry| entry.eagle_lookahead)
+                    {
+                        affected.insert(sequence_hash);
+                    }
+                }
+            }
+            return affected;
         }
         match mutation {
+            CacheEvidenceMutation::StoreEagleLookahead { sequence_hash, .. } => {
+                HashSet::from([*sequence_hash])
+            }
             CacheEvidenceMutation::Remove {
                 tier,
                 group_idx: Some(group),
@@ -542,19 +580,30 @@ impl CacheEvidenceLedger {
                 };
                 block_hashes
                     .iter()
-                    .filter_map(|external| {
-                        self.external_copies
-                            .get(&(*external, copy))
-                            .map(|(sequence, _)| *sequence)
+                    .flat_map(|external| {
+                        let entry = self.physical_external_entries.get(&(*external, copy));
+                        entry
+                            .and_then(|entry| entry.normal_sequence_hash)
+                            .into_iter()
+                            .chain(
+                                entry
+                                    .and_then(|entry| entry.eagle_lookahead)
+                                    .map(|(sequence, _)| sequence),
+                            )
                     })
                     .collect()
             }
             CacheEvidenceMutation::Clear { tier } => self
-                .external_copies
+                .physical_external_entries
                 .iter()
-                .filter_map(|((_, copy), (sequence, _))| {
-                    (copy.owner == owner && tier.is_none_or(|tier| copy.tier == tier))
-                        .then_some(*sequence)
+                .filter(|((_, copy), _)| {
+                    copy.owner == owner && tier.is_none_or(|tier| copy.tier == tier)
+                })
+                .flat_map(|(_, entry)| {
+                    entry
+                        .normal_sequence_hash
+                        .into_iter()
+                        .chain(entry.eagle_lookahead.map(|(sequence, _)| sequence))
                 })
                 .collect(),
             CacheEvidenceMutation::Store { .. }
@@ -569,149 +618,410 @@ impl CacheEvidenceLedger {
         mutations: &[CacheEvidenceMutation],
         result: &mut CacheEvidenceApplyResult,
     ) {
+        let mut planned: HashMap<(u64, PhysicalCopy), PhysicalExternalEntry> = HashMap::new();
+        let mut constraints: HashMap<(u32, u64), u64> = HashMap::new();
+        let mut waiting: HashMap<(u32, u64), Vec<usize>> = HashMap::new();
         let mut ready = VecDeque::new();
-        let mut waiting: HashMap<(u32, u64), Vec<&CacheEvidenceMutation>> = HashMap::new();
-        for mutation in mutations {
-            let Some((_, group_idx, parent_external_hash, parent_sequence_hash, _)) =
-                mutation.store_parts()
-            else {
-                unreachable!("store-only batch was checked by the caller");
-            };
-            let Some(group) = group_idx else {
-                self.mark_physical_telemetry_incomplete();
-                result
-                    .failures
-                    .insert(CacheEvidenceApplyIntegrityFailure::MissingGroup);
-                continue;
-            };
-            match (parent_external_hash, parent_sequence_hash) {
-                (Some(_), Some(_)) => ready.push_back(mutation),
-                (None, Some(_)) => {
-                    self.mark_physical_telemetry_incomplete();
-                    result
-                        .failures
-                        .insert(CacheEvidenceApplyIntegrityFailure::ConflictingMapping);
+
+        for (index, mutation) in mutations.iter().enumerate() {
+            let (group, parent_external, attested) = match mutation {
+                CacheEvidenceMutation::StoreEagleLookahead {
+                    group_idx,
+                    parent_external_hash,
+                    sequence_hash,
+                    ..
+                } => (*group_idx, *parent_external_hash, Some(*sequence_hash)),
+                _ => {
+                    let Some((_, Some(group), parent_external, attested, _)) =
+                        mutation.store_parts()
+                    else {
+                        return self.reject_store_run(result, StoreMutationResult::Invalid);
+                    };
+                    (group, parent_external, attested)
                 }
-                (None, None) => ready.push_back(mutation),
-                (Some(parent), None) if self.parent_sequence_hash(owner, group, parent).is_ok() => {
-                    ready.push_back(mutation);
+            };
+            if let (Some(external), Some(sequence)) = (parent_external, attested) {
+                if constraints
+                    .insert((group, external), sequence)
+                    .is_some_and(|known| known != sequence)
+                {
+                    return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
                 }
-                (Some(parent), None) => waiting.entry((group, parent)).or_default().push(mutation),
+                match self.lookup_parent_sequence_hash(owner, group, external) {
+                    ParentSequenceLookup::Missing => {}
+                    ParentSequenceLookup::Resolved(known) if known == sequence => {}
+                    ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
+                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                    }
+                }
+                ready.push_back(index);
+            } else if let Some(external) = parent_external {
+                match self.lookup_parent_sequence_hash(owner, group, external) {
+                    ParentSequenceLookup::Resolved(_) => ready.push_back(index),
+                    ParentSequenceLookup::Missing => {
+                        waiting.entry((group, external)).or_default().push(index);
+                    }
+                    ParentSequenceLookup::Ambiguous => {
+                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                    }
+                }
+            } else {
+                ready.push_back(index);
             }
         }
 
-        while let Some(mutation) = ready.pop_front() {
-            let Some((tier, group_idx, parent_external_hash, parent_sequence_hash, blocks)) =
-                mutation.store_parts()
-            else {
-                unreachable!("store-only batch was checked by the caller");
+        let mut applied_count = 0usize;
+        while let Some(index) = ready.pop_front() {
+            let mutation = &mutations[index];
+            let applied = match mutation {
+                CacheEvidenceMutation::StoreEagleLookahead {
+                    tier,
+                    group_idx,
+                    parent_external_hash,
+                    sequence_hash,
+                    block,
+                } => self.plan_lookahead_store(
+                    owner,
+                    *tier,
+                    *group_idx,
+                    *parent_external_hash,
+                    *sequence_hash,
+                    *block,
+                    &mut planned,
+                ),
+                _ => {
+                    let Some((tier, Some(group), parent_external, parent_sequence, blocks)) =
+                        mutation.store_parts()
+                    else {
+                        return self.reject_store_run(result, StoreMutationResult::Invalid);
+                    };
+                    self.plan_normal_store(
+                        owner,
+                        tier,
+                        group,
+                        parent_external,
+                        parent_sequence,
+                        blocks,
+                        &mut planned,
+                    )
+                }
             };
-            let Some(group) = group_idx else {
-                unreachable!("invalid groups were rejected before queueing");
-            };
-            match self.apply_store_mutation(
-                owner,
-                tier,
-                Some(group),
-                parent_external_hash,
-                parent_sequence_hash,
-                blocks,
-            ) {
-                StoreMutationResult::Applied => {}
-                StoreMutationResult::MissingParent => {
-                    self.mark_physical_telemetry_incomplete();
-                    result
-                        .failures
-                        .insert(CacheEvidenceApplyIntegrityFailure::MissingParent);
-                    continue;
-                }
-                StoreMutationResult::RejectedMapping => {
-                    self.mark_physical_telemetry_incomplete();
-                    result
-                        .failures
-                        .insert(CacheEvidenceApplyIntegrityFailure::ConflictingMapping);
-                    continue;
-                }
-                StoreMutationResult::Invalid => {
-                    self.mark_physical_telemetry_incomplete();
-                    result
-                        .failures
-                        .insert(CacheEvidenceApplyIntegrityFailure::MissingGroup);
-                    continue;
-                }
+            if applied != StoreMutationResult::Applied {
+                return self.reject_store_run(result, applied);
             }
-            for block in blocks {
-                if let Some(dependents) = waiting.remove(&(group, block.external_hash)) {
-                    ready.extend(dependents);
+            applied_count += 1;
+
+            if let Some((_, Some(group), _, _, blocks)) = mutation.store_parts() {
+                for block in blocks {
+                    let ParentSequenceLookup::Resolved(sequence) =
+                        self.lookup_planned_parent(owner, group, block.external_hash, &mut planned)
+                    else {
+                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                    };
+                    if constraints
+                        .get(&(group, block.external_hash))
+                        .is_some_and(|attested| *attested != sequence)
+                    {
+                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                    }
+                    if let Some(dependents) = waiting.remove(&(group, block.external_hash)) {
+                        ready.extend(dependents);
+                    }
                 }
             }
         }
-        if !waiting.is_empty() {
-            for ((group, parent_external_hash), dependents) in &waiting {
-                if let Some(mutation) = dependents.first() {
-                    self.sample_missing_parent(
-                        owner,
-                        *group,
-                        *parent_external_hash,
-                        mutation,
-                        mutations,
-                    );
-                }
+        if applied_count != mutations.len() {
+            if let Some(((group, external), indexes)) = waiting.iter().next()
+                && let Some(&index) = indexes.first()
+            {
+                self.sample_missing_parent(owner, *group, *external, &mutations[index], mutations);
             }
-            self.mark_physical_telemetry_incomplete();
-            result
-                .failures
-                .insert(CacheEvidenceApplyIntegrityFailure::MissingParent);
+            return self.reject_store_run(result, StoreMutationResult::MissingParent);
+        }
+        let new_keys = planned
+            .keys()
+            .filter(|key| !self.physical_external_entries.contains_key(key))
+            .count();
+        if self
+            .physical_external_entries
+            .len()
+            .saturating_add(new_keys)
+            > self.physical_capacity
+        {
+            return self.reject_store_run(result, StoreMutationResult::Capacity);
+        }
+        for (key @ (_, copy), entry) in planned {
+            let prior = self.physical_external_entries.get(&key).copied();
+            if prior.is_none() {
+                self.increment_physical_count(copy.tier);
+            }
+            if prior.and_then(|entry| entry.normal_sequence_hash).is_none()
+                && let Some(sequence_hash) = entry.normal_sequence_hash
+            {
+                *self.copies.entry((sequence_hash, copy)).or_default() += 1;
+                self.record_seen_blocks([sequence_hash]);
+            }
+            if prior.and_then(|entry| entry.eagle_lookahead).is_none()
+                && let Some((sequence_hash, tokens_hash)) = entry.eagle_lookahead
+            {
+                *self
+                    .eagle_lookahead_copies
+                    .entry((sequence_hash, tokens_hash, copy))
+                    .or_default() += 1;
+            }
+            self.physical_external_entries.insert(key, entry);
         }
     }
 
-    fn apply_store_mutation(
+    fn reject_store_run(
         &mut self,
+        result: &mut CacheEvidenceApplyResult,
+        failure: StoreMutationResult,
+    ) {
+        self.mark_physical_telemetry_incomplete();
+        result.failures.insert(match failure {
+            StoreMutationResult::MissingParent => CacheEvidenceApplyIntegrityFailure::MissingParent,
+            StoreMutationResult::Invalid => CacheEvidenceApplyIntegrityFailure::MissingGroup,
+            StoreMutationResult::Capacity => CacheEvidenceApplyIntegrityFailure::MappingCapacity,
+            StoreMutationResult::RejectedMapping => {
+                CacheEvidenceApplyIntegrityFailure::ConflictingMapping
+            }
+            StoreMutationResult::Applied => unreachable!(),
+        });
+    }
+
+    fn increment_physical_count(&mut self, tier: CacheTier) {
+        match tier {
+            CacheTier::Gpu => self.gpu_physical_blocks += 1,
+            CacheTier::Cpu => self.cpu_physical_blocks += 1,
+        }
+    }
+
+    fn decrement_physical_count(&mut self, tier: CacheTier) {
+        let count = match tier {
+            CacheTier::Gpu => &mut self.gpu_physical_blocks,
+            CacheTier::Cpu => &mut self.cpu_physical_blocks,
+        };
+        *count = count
+            .checked_sub(1)
+            .expect("physical counter must match unified entry map");
+    }
+
+    fn planned_entry(
+        &self,
+        key: (u64, PhysicalCopy),
+        planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
+    ) -> PhysicalExternalEntry {
+        planned.get(&key).copied().unwrap_or_else(|| {
+            self.physical_external_entries
+                .get(&key)
+                .copied()
+                .unwrap_or(PhysicalExternalEntry {
+                    refs: 0,
+                    normal_sequence_hash: None,
+                    eagle_lookahead: None,
+                })
+        })
+    }
+
+    fn merge_planned_entry(
+        &self,
+        key: (u64, PhysicalCopy),
+        normal: Option<u64>,
+        lookahead: Option<(u64, u64)>,
+        planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
+    ) -> StoreMutationResult {
+        let mut entry = self.planned_entry(key, planned);
+        let mut enriched = false;
+        if let Some(normal) = normal {
+            match entry.normal_sequence_hash {
+                Some(known) if known != normal => return StoreMutationResult::RejectedMapping,
+                Some(_) => {}
+                None => {
+                    entry.normal_sequence_hash = Some(normal);
+                    enriched = true;
+                }
+            }
+        }
+        if let Some(lookahead) = lookahead {
+            match entry.eagle_lookahead {
+                Some(known) if known != lookahead => return StoreMutationResult::RejectedMapping,
+                Some(_) => {}
+                None => {
+                    entry.eagle_lookahead = Some(lookahead);
+                    enriched = true;
+                }
+            }
+        }
+        if entry.refs == 0 {
+            entry.refs = 1;
+        } else if !enriched {
+            entry.refs = entry.refs.saturating_add(1);
+        }
+        planned.insert(key, entry);
+        StoreMutationResult::Applied
+    }
+
+    fn plan_normal_store(
+        &self,
         owner: CacheOwner,
         tier: CacheTier,
-        group: Option<u32>,
+        group: u32,
         parent_external_hash: Option<u64>,
-        parent_sequence_hash: Option<u64>,
+        attested_parent: Option<u64>,
         blocks: &[CacheEvidenceStoredBlock],
+        planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
     ) -> StoreMutationResult {
-        let Some(group) = group else {
-            return StoreMutationResult::Invalid;
-        };
-        let mut parent_sequence_hash = match self.resolve_store_parent(
+        let mut parent = match self.resolve_planned_parent(
             owner,
             group,
             parent_external_hash,
-            parent_sequence_hash,
+            attested_parent,
+            planned,
         ) {
             Ok(parent) => parent,
-            Err(result) => return result,
+            Err(failure) => return failure,
         };
-        let copy = PhysicalCopy { owner, tier, group };
-        let mut mappings = Vec::with_capacity(blocks.len());
-        let mut proposed = HashMap::new();
         for block in blocks {
-            let sequence_hash = parent_sequence_hash.map_or(block.tokens_hash, |parent| {
+            let sequence_hash = parent.map_or(block.tokens_hash, |parent| {
                 compute_next_seq_hash(parent, LocalBlockHash(block.tokens_hash))
             });
+            let mut lookahead = None;
+            for source_tier in [CacheTier::Gpu, CacheTier::Cpu] {
+                let source = (
+                    block.external_hash,
+                    PhysicalCopy {
+                        owner,
+                        tier: source_tier,
+                        group,
+                    },
+                );
+                let source_entry = self.planned_entry(source, planned);
+                if source_entry
+                    .normal_sequence_hash
+                    .is_some_and(|known| known != sequence_hash)
+                {
+                    return StoreMutationResult::RejectedMapping;
+                }
+                if let Some(candidate) = source_entry.eagle_lookahead {
+                    if lookahead.is_some_and(|known| known != candidate) {
+                        return StoreMutationResult::RejectedMapping;
+                    }
+                    lookahead = Some(candidate);
+                }
+            }
+            let result = self.merge_planned_entry(
+                (block.external_hash, PhysicalCopy { owner, tier, group }),
+                Some(sequence_hash),
+                lookahead,
+                planned,
+            );
+            if result != StoreMutationResult::Applied {
+                return result;
+            }
+            parent = Some(sequence_hash);
+        }
+        StoreMutationResult::Applied
+    }
+
+    fn plan_lookahead_store(
+        &self,
+        owner: CacheOwner,
+        tier: CacheTier,
+        group: u32,
+        parent_external_hash: Option<u64>,
+        sequence_hash: u64,
+        block: CacheEvidenceStoredBlock,
+        planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
+    ) -> StoreMutationResult {
+        if let Some(parent_external_hash) = parent_external_hash {
+            match self.lookup_planned_parent(owner, group, parent_external_hash, planned) {
+                ParentSequenceLookup::Missing => {}
+                ParentSequenceLookup::Resolved(known) if known == sequence_hash => {}
+                ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
+                    return StoreMutationResult::RejectedMapping;
+                }
+            }
+        }
+        let lookahead = (sequence_hash, block.tokens_hash);
+        for source_tier in [CacheTier::Gpu, CacheTier::Cpu] {
+            let key = (
+                block.external_hash,
+                PhysicalCopy {
+                    owner,
+                    tier: source_tier,
+                    group,
+                },
+            );
             if self
-                .external_copies
-                .get(&(block.external_hash, copy))
-                .is_some_and(|(mapped_hash, _)| *mapped_hash != sequence_hash)
-                || proposed
-                    .insert(block.external_hash, sequence_hash)
-                    .is_some_and(|mapped_hash| mapped_hash != sequence_hash)
+                .planned_entry(key, planned)
+                .eagle_lookahead
+                .is_some_and(|known| known != lookahead)
             {
                 return StoreMutationResult::RejectedMapping;
             }
-            mappings.push((block.external_hash, sequence_hash));
-            parent_sequence_hash = Some(sequence_hash);
         }
-        self.record_seen_blocks(mappings.iter().map(|(_, sequence_hash)| *sequence_hash));
-        for (external_hash, sequence_hash) in mappings {
-            let applied = self.try_store_mapped(owner, tier, group, external_hash, sequence_hash);
-            debug_assert!(applied, "store mapping was validated before mutation");
+        self.merge_planned_entry(
+            (block.external_hash, PhysicalCopy { owner, tier, group }),
+            None,
+            Some(lookahead),
+            planned,
+        )
+    }
+
+    fn resolve_planned_parent(
+        &self,
+        owner: CacheOwner,
+        group: u32,
+        external_hash: Option<u64>,
+        attested: Option<u64>,
+        planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
+    ) -> Result<Option<u64>, StoreMutationResult> {
+        match (external_hash, attested) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(StoreMutationResult::Invalid),
+            (Some(external), None) => {
+                match self.lookup_planned_parent(owner, group, external, planned) {
+                    ParentSequenceLookup::Resolved(hash) => Ok(Some(hash)),
+                    ParentSequenceLookup::Missing => Err(StoreMutationResult::MissingParent),
+                    ParentSequenceLookup::Ambiguous => Err(StoreMutationResult::RejectedMapping),
+                }
+            }
+            (Some(external), Some(attested)) => match self
+                .lookup_planned_parent(owner, group, external, planned)
+            {
+                ParentSequenceLookup::Missing => Ok(Some(attested)),
+                ParentSequenceLookup::Resolved(known) if known == attested => Ok(Some(attested)),
+                ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
+                    Err(StoreMutationResult::RejectedMapping)
+                }
+            },
         }
-        StoreMutationResult::Applied
+    }
+
+    fn lookup_planned_parent(
+        &self,
+        owner: CacheOwner,
+        group: u32,
+        external_hash: u64,
+        planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
+    ) -> ParentSequenceLookup {
+        let mut resolved = None;
+        for tier in [CacheTier::Gpu, CacheTier::Cpu] {
+            let key = (external_hash, PhysicalCopy { owner, tier, group });
+            let Some(sequence) = self.planned_entry(key, planned).normal_sequence_hash else {
+                continue;
+            };
+            match resolved {
+                Some(known) if known != sequence => return ParentSequenceLookup::Ambiguous,
+                Some(_) => {}
+                None => resolved = Some(sequence),
+            }
+        }
+        resolved.map_or(
+            ParentSequenceLookup::Missing,
+            ParentSequenceLookup::Resolved,
+        )
     }
 
     fn resolve_store_parent(
@@ -760,25 +1070,22 @@ impl CacheEvidenceLedger {
         let CacheEvidenceMutation::Store { tier, blocks, .. } = mutation else {
             return;
         };
-        let present_gpu = self.external_copies.contains_key(&(
-            parent_external_hash,
-            PhysicalCopy {
-                owner,
-                tier: CacheTier::Gpu,
-                group,
-            },
-        ));
-        let present_cpu = self.external_copies.contains_key(&(
-            parent_external_hash,
-            PhysicalCopy {
-                owner,
-                tier: CacheTier::Cpu,
-                group,
-            },
-        ));
-        let present_other_group = self.external_copies.keys().any(|(external, copy)| {
-            *external == parent_external_hash && copy.owner == owner && copy.group != group
-        });
+        let has_normal = |tier| {
+            self.physical_external_entries
+                .get(&(parent_external_hash, PhysicalCopy { owner, tier, group }))
+                .is_some_and(|entry| entry.normal_sequence_hash.is_some())
+        };
+        let present_gpu = has_normal(CacheTier::Gpu);
+        let present_cpu = has_normal(CacheTier::Cpu);
+        let present_other_group =
+            self.physical_external_entries
+                .iter()
+                .any(|((external, copy), entry)| {
+                    *external == parent_external_hash
+                        && copy.owner == owner
+                        && copy.group != group
+                        && entry.normal_sequence_hash.is_some()
+                });
         let ever_seen_same_group =
             self.seen_external_hashes
                 .contains(&(owner, group, parent_external_hash));
@@ -847,15 +1154,19 @@ impl CacheEvidenceLedger {
         let mut resolved = None;
         for tier in [CacheTier::Gpu, CacheTier::Cpu] {
             let copy = PhysicalCopy { owner, tier, group };
-            let Some((sequence_hash, _)) = self.external_copies.get(&(external_hash, copy)) else {
+            let Some(sequence_hash) = self
+                .physical_external_entries
+                .get(&(external_hash, copy))
+                .and_then(|entry| entry.normal_sequence_hash)
+            else {
                 continue;
             };
             match resolved {
-                Some(existing) if existing != *sequence_hash => {
+                Some(existing) if existing != sequence_hash => {
                     return ParentSequenceLookup::Ambiguous;
                 }
                 Some(_) => {}
-                None => resolved = Some(*sequence_hash),
+                None => resolved = Some(sequence_hash),
             }
         }
         resolved.map_or(
@@ -888,25 +1199,42 @@ impl CacheEvidenceLedger {
         sequence_hash: u64,
     ) -> bool {
         let copy = PhysicalCopy { owner, tier, group };
-        if self
-            .external_copies
-            .get(&(external_hash, copy))
-            .is_some_and(|(mapped_hash, _)| *mapped_hash != sequence_hash)
+        let key = (external_hash, copy);
+        let is_new = !self.physical_external_entries.contains_key(&key);
+        let mut entry =
+            self.physical_external_entries
+                .get(&key)
+                .copied()
+                .unwrap_or(PhysicalExternalEntry {
+                    refs: 0,
+                    normal_sequence_hash: None,
+                    eagle_lookahead: None,
+                });
+        if entry
+            .normal_sequence_hash
+            .is_some_and(|mapped_hash| mapped_hash != sequence_hash)
         {
             self.mark_physical_telemetry_incomplete();
             return false;
         }
-        let external = self
-            .external_copies
-            .entry((external_hash, copy))
-            .or_insert((sequence_hash, 0));
-        external.1 = external.1.saturating_add(1);
+        let enriched = entry.normal_sequence_hash.is_none();
+        entry.normal_sequence_hash = Some(sequence_hash);
+        if entry.refs == 0 {
+            entry.refs = 1;
+        } else if !enriched {
+            entry.refs = entry.refs.saturating_add(1);
+        }
+        self.physical_external_entries.insert(key, entry);
+        if is_new {
+            self.increment_physical_count(tier);
+        }
         if self.seen_external_hashes.len() < self.history_capacity {
             self.seen_external_hashes
                 .insert((owner, group, external_hash));
         }
-        let count = self.copies.entry((sequence_hash, copy)).or_default();
-        *count = count.saturating_add(1);
+        if enriched {
+            *self.copies.entry((sequence_hash, copy)).or_default() += 1;
+        }
         // Store events include generated blocks as they become complete. They
         // therefore extend bounded reuse history even when no later request
         // has yet carried those generated tokens back in its prompt.
@@ -927,33 +1255,80 @@ impl CacheEvidenceLedger {
     ) {
         let copy = PhysicalCopy { owner, tier, group };
         let external_key = (external_hash, copy);
-        let Some((tokens_hash, external_count)) = self.external_copies.get_mut(&external_key)
-        else {
+        let Some(mut entry) = self.physical_external_entries.get(&external_key).copied() else {
             self.mark_physical_telemetry_incomplete();
             return;
         };
-        let tokens_hash = *tokens_hash;
-        if *external_count == 1 {
-            self.external_copies.remove(&external_key);
-        } else {
-            *external_count -= 1;
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            self.physical_external_entries.insert(external_key, entry);
+            return;
         }
-        let key = (tokens_hash, copy);
-        let Some(count) = self.copies.get_mut(&key) else {
+        let normal_key = entry
+            .normal_sequence_hash
+            .map(|sequence_hash| (sequence_hash, copy));
+        let lookahead_key = entry
+            .eagle_lookahead
+            .map(|(sequence_hash, tokens_hash)| (sequence_hash, tokens_hash, copy));
+        if normal_key.is_some_and(|key| self.copies.get(&key).is_none_or(|count| *count == 0))
+            || lookahead_key.is_some_and(|key| {
+                self.eagle_lookahead_copies
+                    .get(&key)
+                    .is_none_or(|count| *count == 0)
+            })
+        {
             self.mark_physical_telemetry_incomplete();
             return;
-        };
-        if *count == 1 {
-            self.copies.remove(&key);
-        } else {
-            *count -= 1;
         }
+        if let Some(sequence_hash) = entry.normal_sequence_hash {
+            let key = (sequence_hash, copy);
+            let count = self.copies.get_mut(&key).expect("preflighted normal role");
+            if *count == 1 {
+                self.copies.remove(&key);
+            } else {
+                *count -= 1;
+            }
+        }
+        if let Some((sequence_hash, tokens_hash)) = entry.eagle_lookahead {
+            let key = (sequence_hash, tokens_hash, copy);
+            let count = self
+                .eagle_lookahead_copies
+                .get_mut(&key)
+                .expect("preflighted lookahead role");
+            if *count == 1 {
+                self.eagle_lookahead_copies.remove(&key);
+            } else {
+                *count -= 1;
+            }
+        }
+        self.physical_external_entries.remove(&external_key);
+        self.decrement_physical_count(tier);
     }
 
     pub fn clear_owner(&mut self, owner: CacheOwner) {
+        let mut removed_gpu = 0usize;
+        let mut removed_cpu = 0usize;
+        self.physical_external_entries.retain(|(_, copy), _| {
+            let remove = copy.owner == owner;
+            if remove {
+                match copy.tier {
+                    CacheTier::Gpu => removed_gpu += 1,
+                    CacheTier::Cpu => removed_cpu += 1,
+                }
+            }
+            !remove
+        });
         self.copies.retain(|(_, copy), _| copy.owner != owner);
-        self.external_copies
-            .retain(|(_, copy), _| copy.owner != owner);
+        self.gpu_physical_blocks = self
+            .gpu_physical_blocks
+            .checked_sub(removed_gpu)
+            .expect("GPU physical counter must match unified entry map");
+        self.cpu_physical_blocks = self
+            .cpu_physical_blocks
+            .checked_sub(removed_cpu)
+            .expect("CPU physical counter must match unified entry map");
+        self.eagle_lookahead_copies
+            .retain(|(_, _, copy), _| copy.owner != owner);
         self.seen_external_hashes
             .retain(|(seen_owner, _, _)| *seen_owner != owner);
         self.sampled_missing_parent_keys
@@ -961,10 +1336,23 @@ impl CacheEvidenceLedger {
     }
 
     pub fn clear_owner_tier(&mut self, owner: CacheOwner, tier: CacheTier) {
+        let mut removed = 0usize;
+        self.physical_external_entries.retain(|(_, copy), _| {
+            let remove = copy.owner == owner && copy.tier == tier;
+            removed += usize::from(remove);
+            !remove
+        });
         self.copies
             .retain(|(_, copy), _| copy.owner != owner || copy.tier != tier);
-        self.external_copies
-            .retain(|(_, copy), _| copy.owner != owner || copy.tier != tier);
+        let count = match tier {
+            CacheTier::Gpu => &mut self.gpu_physical_blocks,
+            CacheTier::Cpu => &mut self.cpu_physical_blocks,
+        };
+        *count = count
+            .checked_sub(removed)
+            .expect("tier physical counter must match unified entry map");
+        self.eagle_lookahead_copies
+            .retain(|(_, _, copy), _| copy.owner != owner || copy.tier != tier);
     }
 
     /// Remove all physical state and cache-shape declarations for a worker
@@ -1078,7 +1466,12 @@ impl CacheEvidenceLedger {
         groups: &[CacheGroupHashSequence],
         max_tokens: u64,
     ) -> KnownPrefixLength {
-        hybrid_prefix(groups, max_tokens, |_, hash| self.reusable(hash))
+        hybrid_prefix(
+            groups,
+            max_tokens,
+            |_, hash| self.reusable(hash),
+            |_, _, _| KnownBool::No,
+        )
     }
 
     /// Longest prefix physically reusable on one worker across its GPU and CPU
@@ -1089,26 +1482,54 @@ impl CacheEvidenceLedger {
         max_tokens: u64,
         owner: CacheOwner,
     ) -> KnownPrefixLength {
-        hybrid_prefix(groups, max_tokens, |group, hash| {
-            let mut declared = false;
-            for tier in [CacheTier::Gpu, CacheTier::Cpu] {
-                if self.required_groups.contains_key(&(owner, tier)) {
-                    declared = true;
+        hybrid_prefix(
+            groups,
+            max_tokens,
+            |group, hash| {
+                let mut declared = false;
+                for tier in [CacheTier::Gpu, CacheTier::Cpu] {
+                    if self.required_groups.contains_key(&(owner, tier)) {
+                        declared = true;
+                    }
+                    if self
+                        .copies
+                        .get(&(hash, PhysicalCopy { owner, tier, group }))
+                        .is_some_and(|&count| count > 0)
+                    {
+                        return KnownBool::Yes;
+                    }
                 }
-                if self
-                    .copies
-                    .get(&(hash, PhysicalCopy { owner, tier, group }))
-                    .is_some_and(|&count| count > 0)
-                {
-                    return KnownBool::Yes;
+                if declared {
+                    self.negative_physical_fact()
+                } else {
+                    KnownBool::Unknown
                 }
-            }
-            if declared {
-                self.negative_physical_fact()
-            } else {
-                KnownBool::Unknown
-            }
-        })
+            },
+            |group, preceding_hash, lookahead_block_hash| {
+                let mut declared = false;
+                for tier in [CacheTier::Gpu, CacheTier::Cpu] {
+                    if self.required_groups.contains_key(&(owner, tier)) {
+                        declared = true;
+                    }
+                    if self
+                        .eagle_lookahead_copies
+                        .get(&(
+                            preceding_hash,
+                            lookahead_block_hash,
+                            PhysicalCopy { owner, tier, group },
+                        ))
+                        .is_some_and(|&count| count > 0)
+                    {
+                        return KnownBool::Yes;
+                    }
+                }
+                if declared {
+                    self.negative_physical_fact()
+                } else {
+                    KnownBool::Unknown
+                }
+            },
+        )
     }
 
     /// Maximum physically reusable prefix on any worker. If an incompletely
@@ -1179,6 +1600,7 @@ fn hybrid_prefix(
     groups: &[CacheGroupHashSequence],
     max_tokens: u64,
     mut present: impl FnMut(u32, u64) -> KnownBool,
+    mut lookahead_present: impl FnMut(u32, u64, u64) -> KnownBool,
 ) -> KnownPrefixLength {
     if groups.is_empty() {
         return KnownPrefixLength::Unknown;
@@ -1206,7 +1628,13 @@ fn hybrid_prefix(
             } else {
                 current
             };
-            let next = match group_prefix(group, lookup_limit, drop_eagle, &mut present) {
+            let next = match group_prefix(
+                group,
+                lookup_limit,
+                drop_eagle,
+                &mut present,
+                &mut lookahead_present,
+            ) {
                 KnownPrefixLength::Known(value) => value,
                 KnownPrefixLength::Unknown => return KnownPrefixLength::Unknown,
             };
@@ -1229,6 +1657,7 @@ fn group_prefix(
     max_tokens: u64,
     drop_eagle: bool,
     present: &mut impl FnMut(u32, u64) -> KnownBool,
+    lookahead_present: &mut impl FnMut(u32, u64, u64) -> KnownBool,
 ) -> KnownPrefixLength {
     match group.kind {
         CacheGroupKind::FullAttention => {
@@ -1249,7 +1678,7 @@ fn group_prefix(
             KnownPrefixLength::Known(hit)
         }
         CacheGroupKind::SlidingWindow => {
-            sliding_window_prefix(group, max_tokens, drop_eagle, present)
+            sliding_window_prefix(group, max_tokens, drop_eagle, present, lookahead_present)
         }
     }
 }
@@ -1259,6 +1688,7 @@ fn sliding_window_prefix(
     max_tokens: u64,
     drop_eagle: bool,
     present: &mut impl FnMut(u32, u64) -> KnownBool,
+    lookahead_present: &mut impl FnMut(u32, u64, u64) -> KnownBool,
 ) -> KnownPrefixLength {
     let block_size = u64::from(group.block_size);
     let alignment = u64::from(group.alignment_tokens);
@@ -1275,8 +1705,32 @@ fn sliding_window_prefix(
             continue;
         }
         let mut all_present = true;
-        for &hash in &group.sequence_hashes[end - needed..end] {
-            match present(group.group_idx, hash) {
+        let window_hashes = &group.sequence_hashes[end - needed..end];
+        for (index, &hash) in window_hashes.iter().enumerate() {
+            let fact = if drop_eagle && index + 1 == window_hashes.len() {
+                match present(group.group_idx, hash) {
+                    KnownBool::Yes => KnownBool::Yes,
+                    normal => {
+                        if index == 0 {
+                            return KnownPrefixLength::Known(0);
+                        }
+                        let preceding = window_hashes[index - 1];
+                        let Some(&lookahead_block_hash) =
+                            group.eagle_lookahead_block_hashes.get(end - 1)
+                        else {
+                            return KnownPrefixLength::Unknown;
+                        };
+                        match lookahead_present(group.group_idx, preceding, lookahead_block_hash) {
+                            KnownBool::Yes => KnownBool::Yes,
+                            KnownBool::No => normal,
+                            KnownBool::Unknown => KnownBool::Unknown,
+                        }
+                    }
+                }
+            } else {
+                present(group.group_idx, hash)
+            };
+            match fact {
                 KnownBool::Yes => {}
                 KnownBool::No => {
                     all_present = false;
@@ -1580,6 +2034,69 @@ mod tests {
         dp_rank: 0,
     };
 
+    fn evidence_batch(mutations: Vec<CacheEvidenceMutation>) -> CacheEvidenceBatch {
+        CacheEvidenceBatch {
+            owner: WORKER_A,
+            source_cursor: 1,
+            source_incarnation_id: None,
+            heartbeat: false,
+            watermark_source_cursor: None,
+            telemetry_complete: true,
+            mutations,
+            barrier_id: None,
+            epoch_id: None,
+        }
+    }
+
+    fn lookahead_store(
+        tier: CacheTier,
+        external_hash: u64,
+        sequence_hash: u64,
+        tokens_hash: u64,
+    ) -> CacheEvidenceMutation {
+        CacheEvidenceMutation::StoreEagleLookahead {
+            tier,
+            group_idx: 0,
+            parent_external_hash: None,
+            sequence_hash,
+            block: CacheEvidenceStoredBlock {
+                external_hash,
+                tokens_hash,
+            },
+        }
+    }
+
+    fn normal_store(
+        tier: CacheTier,
+        external_hash: u64,
+        sequence_hash: u64,
+    ) -> CacheEvidenceMutation {
+        CacheEvidenceMutation::Store {
+            tier,
+            group_idx: Some(0),
+            parent_external_hash: None,
+            blocks: vec![CacheEvidenceStoredBlock {
+                external_hash,
+                tokens_hash: sequence_hash,
+            }],
+        }
+    }
+
+    fn assert_physical_counter_oracle(ledger: &CacheEvidenceLedger) {
+        let gpu = ledger
+            .physical_external_entries
+            .keys()
+            .filter(|(_, copy)| copy.tier == CacheTier::Gpu)
+            .count();
+        let cpu = ledger
+            .physical_external_entries
+            .keys()
+            .filter(|(_, copy)| copy.tier == CacheTier::Cpu)
+            .count();
+        assert_eq!(ledger.stats().gpu_physical_blocks, gpu);
+        assert_eq!(ledger.stats().cpu_physical_blocks, cpu);
+    }
+
     fn recomputed() -> TokenObservation {
         TokenObservation {
             complete: true,
@@ -1590,6 +2107,154 @@ mod tests {
             selected_resident_at_lookup: true,
             source: TokenSource::Recomputed,
         }
+    }
+
+    #[test]
+    fn unified_physical_entry_enriches_roles_without_inventing_references() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.record_group_catalog(WORKER_A, CacheTier::Gpu, [0]);
+        ledger.seal_physical_scope();
+
+        assert!(
+            ledger.apply_evidence_batch(&evidence_batch(vec![lookahead_store(
+                CacheTier::Gpu,
+                100,
+                10,
+                20,
+            )]))
+        );
+        assert_eq!(ledger.stats().history_blocks, 0);
+        assert!(ledger.copies.is_empty());
+        assert!(
+            ledger.apply_evidence_batch(&evidence_batch(vec![normal_store(
+                CacheTier::Gpu,
+                100,
+                10,
+            )]))
+        );
+        let copy = PhysicalCopy {
+            owner: WORKER_A,
+            tier: CacheTier::Gpu,
+            group: 0,
+        };
+        assert_eq!(
+            ledger.physical_external_entries.get(&(100, copy)),
+            Some(&PhysicalExternalEntry {
+                refs: 1,
+                normal_sequence_hash: Some(10),
+                eagle_lookahead: Some((10, 20)),
+            })
+        );
+        assert_eq!(ledger.stats().history_blocks, 1);
+        assert_physical_counter_oracle(&ledger);
+        ledger.remove_external(WORKER_A, CacheTier::Gpu, 0, 100);
+        assert!(!ledger.physical_external_entries.contains_key(&(100, copy)));
+        assert!(ledger.copies.is_empty());
+        assert!(ledger.eagle_lookahead_copies.is_empty());
+        assert_physical_counter_oracle(&ledger);
+
+        assert!(
+            ledger.apply_evidence_batch(&evidence_batch(vec![normal_store(
+                CacheTier::Gpu,
+                101,
+                11,
+            )]))
+        );
+        assert!(
+            ledger.apply_evidence_batch(&evidence_batch(vec![lookahead_store(
+                CacheTier::Gpu,
+                101,
+                11,
+                21,
+            )]))
+        );
+        assert_eq!(ledger.physical_external_entries[&(101, copy)].refs, 1);
+        ledger.remove_external(WORKER_A, CacheTier::Gpu, 0, 101);
+        assert!(!ledger.physical_external_entries.contains_key(&(101, copy)));
+        assert_physical_counter_oracle(&ledger);
+    }
+
+    #[test]
+    fn duplicate_role_and_cross_tier_transfer_follow_physical_reference_lifecycle() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.record_group_catalog(WORKER_A, CacheTier::Gpu, [0]);
+        ledger.record_group_catalog(WORKER_A, CacheTier::Cpu, [0]);
+        ledger.seal_physical_scope();
+        let marker = lookahead_store(CacheTier::Gpu, 100, 9, 20);
+        assert!(ledger.apply_evidence_batch(&evidence_batch(vec![marker.clone(), marker])));
+        let gpu = PhysicalCopy {
+            owner: WORKER_A,
+            tier: CacheTier::Gpu,
+            group: 0,
+        };
+        assert_eq!(ledger.physical_external_entries[&(100, gpu)].refs, 2);
+        ledger.remove_external(WORKER_A, CacheTier::Gpu, 0, 100);
+        assert_eq!(ledger.physical_external_entries[&(100, gpu)].refs, 1);
+
+        let cpu_store = normal_store(CacheTier::Cpu, 100, 10);
+        assert_eq!(
+            ledger.affected_sequence_hashes(WORKER_A, &cpu_store),
+            HashSet::from([9, 10])
+        );
+        assert!(ledger.apply_evidence_batch(&evidence_batch(vec![cpu_store])));
+        let cpu = PhysicalCopy {
+            owner: WORKER_A,
+            tier: CacheTier::Cpu,
+            group: 0,
+        };
+        assert_eq!(ledger.physical_external_entries[&(100, cpu)].refs, 1);
+        assert_eq!(
+            ledger.physical_external_entries[&(100, cpu)].eagle_lookahead,
+            Some((9, 20))
+        );
+        assert_physical_counter_oracle(&ledger);
+        ledger.remove_external(WORKER_A, CacheTier::Gpu, 0, 100);
+        assert!(ledger.resident_on(10, WORKER_A) == KnownBool::Yes);
+        assert!(ledger.eagle_lookahead_copies.contains_key(&(9, 20, cpu)));
+        ledger.remove_external(WORKER_A, CacheTier::Cpu, 0, 100);
+        assert!(ledger.physical_external_entries.is_empty());
+        assert!(ledger.eagle_lookahead_copies.is_empty());
+        assert_physical_counter_oracle(&ledger);
+    }
+
+    #[test]
+    fn store_run_conflict_and_capacity_roll_back_all_touched_entries() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.physical_capacity = 2;
+        assert!(
+            ledger.apply_evidence_batch(&evidence_batch(vec![lookahead_store(
+                CacheTier::Gpu,
+                100,
+                10,
+                20,
+            )]))
+        );
+        let before = ledger.physical_external_entries.clone();
+        let conflict = ledger.apply_evidence_batch_with_diagnostics(&evidence_batch(vec![
+            normal_store(CacheTier::Cpu, 101, 11),
+            lookahead_store(CacheTier::Cpu, 100, 12, 20),
+        ]));
+        assert_eq!(
+            conflict.failures().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
+        );
+        assert_eq!(ledger.physical_external_entries, before);
+        assert_physical_counter_oracle(&ledger);
+
+        let mut capacity = CacheEvidenceLedger::new(16);
+        capacity.physical_capacity = 1;
+        let result = capacity.apply_evidence_batch_with_diagnostics(&evidence_batch(vec![
+            normal_store(CacheTier::Gpu, 200, 20),
+            lookahead_store(CacheTier::Gpu, 201, 20, 21),
+        ]));
+        assert_eq!(
+            result.failures().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::MappingCapacity])
+        );
+        assert!(capacity.physical_external_entries.is_empty());
+        assert!(capacity.copies.is_empty());
+        assert!(capacity.eagle_lookahead_copies.is_empty());
+        assert_physical_counter_oracle(&capacity);
     }
 
     #[test]
@@ -2193,9 +2858,14 @@ mod tests {
             HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
         );
         assert_eq!(ledger.stats().cpu_physical_blocks, cpu_blocks_before);
-        assert!(!ledger.external_copies.keys().any(|(external_hash, copy)| {
-            *external_hash == 101 && copy.owner == WORKER_A && copy.group == 0
-        }));
+        assert!(
+            !ledger
+                .physical_external_entries
+                .keys()
+                .any(|(external_hash, copy)| {
+                    *external_hash == 101 && copy.owner == WORKER_A && copy.group == 0
+                })
+        );
     }
 
     #[test]
@@ -2598,15 +3268,22 @@ mod tests {
 
         assert_eq!(
             result.failures().collect::<HashSet<_>>(),
-            HashSet::from([
-                CacheEvidenceApplyIntegrityFailure::ConflictingMapping,
-                CacheEvidenceApplyIntegrityFailure::MissingParent,
-            ])
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
         );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().cpu_physical_blocks, 1);
-        assert!(!ledger.external_copies.keys().any(|(hash, _)| *hash == 100));
-        assert!(!ledger.external_copies.keys().any(|(hash, _)| *hash == 102));
+        assert!(
+            !ledger
+                .physical_external_entries
+                .keys()
+                .any(|(hash, _)| *hash == 100)
+        );
+        assert!(
+            !ledger
+                .physical_external_entries
+                .keys()
+                .any(|(hash, _)| *hash == 102)
+        );
     }
 
     #[test]
@@ -2640,12 +3317,17 @@ mod tests {
 
         assert_eq!(
             result.failures().collect::<HashSet<_>>(),
-            HashSet::from([CacheEvidenceApplyIntegrityFailure::MissingParent])
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
         );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().gpu_physical_blocks, 1);
         assert_eq!(ledger.stats().cpu_physical_blocks, 1);
-        assert!(!ledger.external_copies.keys().any(|(hash, _)| *hash == 101));
+        assert!(
+            !ledger
+                .physical_external_entries
+                .keys()
+                .any(|(hash, _)| *hash == 101)
+        );
     }
 
     #[test]
@@ -2689,14 +3371,22 @@ mod tests {
             is_eagle: false,
             alignment_tokens: 32,
             sequence_hashes: (1..=12).collect(),
+            eagle_lookahead_block_hashes: Vec::new(),
         };
         let resident: HashSet<_> = [7, 8].into_iter().collect();
         assert_eq!(
-            hybrid_prefix(&[group], 96, |_, hash| if resident.contains(&hash) {
-                KnownBool::Yes
-            } else {
-                KnownBool::No
-            }),
+            hybrid_prefix(
+                &[group],
+                96,
+                |_, hash| {
+                    if resident.contains(&hash) {
+                        KnownBool::Yes
+                    } else {
+                        KnownBool::No
+                    }
+                },
+                |_, _, _| KnownBool::No,
+            ),
             KnownPrefixLength::Known(64)
         );
     }
@@ -2712,6 +3402,7 @@ mod tests {
                 is_eagle: false,
                 alignment_tokens: 32,
                 sequence_hashes: vec![10, 20, 30],
+                eagle_lookahead_block_hashes: Vec::new(),
             },
             CacheGroupHashSequence {
                 group_idx: 1,
@@ -2721,15 +3412,23 @@ mod tests {
                 is_eagle: false,
                 alignment_tokens: 32,
                 sequence_hashes: (101..=112).collect(),
+                eagle_lookahead_block_hashes: Vec::new(),
             },
         ];
         let resident: HashSet<_> = [10, 20, 107, 108, 111, 112].into_iter().collect();
         assert_eq!(
-            hybrid_prefix(&groups, 96, |_, hash| if resident.contains(&hash) {
-                KnownBool::Yes
-            } else {
-                KnownBool::No
-            }),
+            hybrid_prefix(
+                &groups,
+                96,
+                |_, hash| {
+                    if resident.contains(&hash) {
+                        KnownBool::Yes
+                    } else {
+                        KnownBool::No
+                    }
+                },
+                |_, _, _| KnownBool::No,
+            ),
             KnownPrefixLength::Known(64)
         );
     }
@@ -2744,13 +3443,21 @@ mod tests {
             is_eagle: false,
             alignment_tokens: 32,
             sequence_hashes: vec![1, 2],
+            eagle_lookahead_block_hashes: Vec::new(),
         };
         assert_eq!(
-            hybrid_prefix(&[group], 64, |_, hash| if hash == 1 {
-                KnownBool::Yes
-            } else {
-                KnownBool::Unknown
-            }),
+            hybrid_prefix(
+                &[group],
+                64,
+                |_, hash| {
+                    if hash == 1 {
+                        KnownBool::Yes
+                    } else {
+                        KnownBool::Unknown
+                    }
+                },
+                |_, _, _| KnownBool::Unknown,
+            ),
             KnownPrefixLength::Unknown
         );
     }

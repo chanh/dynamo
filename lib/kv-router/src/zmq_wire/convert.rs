@@ -83,6 +83,9 @@ pub fn convert_event(
             ownership: _,
             parent_sequence_hash: _,
             parent_sequence_hash_algorithm: _,
+            eagle_lookahead_sequence_hash: _,
+            eagle_lookahead_sequence_hash_algorithm: _,
+            eagle_lookahead_token_ids: _,
         } => {
             // Reject self-referencing blocks: all block hashes (including parent) must be unique.
             {

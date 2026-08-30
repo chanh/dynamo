@@ -49,6 +49,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
         let mut parent_block_hash: Option<Option<BlockHashValue>> = None;
         let mut parent_sequence_hash: Option<Option<BlockHashValue>> = None;
         let mut parent_sequence_hash_algorithm: Option<Option<String>> = None;
+        let mut eagle_lookahead_sequence_hash: Option<Option<BlockHashValue>> = None;
+        let mut eagle_lookahead_sequence_hash_algorithm: Option<Option<String>> = None;
+        let mut eagle_lookahead_token_ids: Option<Option<Vec<u32>>> = None;
         let mut token_ids: Option<KvTokenIds> = None;
         let mut block_size: Option<usize> = None;
         let mut medium: Option<Option<String>> = None;
@@ -77,6 +80,15 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 }
                 "parent_sequence_hash_algorithm" => {
                     parent_sequence_hash_algorithm = Some(map.next_value()?);
+                }
+                "eagle_lookahead_sequence_hash" => {
+                    eagle_lookahead_sequence_hash = Some(map.next_value()?);
+                }
+                "eagle_lookahead_sequence_hash_algorithm" => {
+                    eagle_lookahead_sequence_hash_algorithm = Some(map.next_value()?);
+                }
+                "eagle_lookahead_token_ids" => {
+                    eagle_lookahead_token_ids = Some(map.next_value()?);
                 }
                 "token_ids" => {
                     token_ids = Some(map.next_value()?);
@@ -145,6 +157,10 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                     parent_block_hash: parent_block_hash.unwrap_or(None),
                     parent_sequence_hash: parent_sequence_hash.unwrap_or(None),
                     parent_sequence_hash_algorithm: parent_sequence_hash_algorithm.unwrap_or(None),
+                    eagle_lookahead_sequence_hash: eagle_lookahead_sequence_hash.unwrap_or(None),
+                    eagle_lookahead_sequence_hash_algorithm:
+                        eagle_lookahead_sequence_hash_algorithm.unwrap_or(None),
+                    eagle_lookahead_token_ids: eagle_lookahead_token_ids.unwrap_or(None),
                     token_ids: raw_token_ids,
                     block_size,
                     medium,
@@ -243,6 +259,9 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                     parent_block_hash,
                     parent_sequence_hash: None,
                     parent_sequence_hash_algorithm: None,
+                    eagle_lookahead_sequence_hash: None,
+                    eagle_lookahead_sequence_hash_algorithm: None,
+                    eagle_lookahead_token_ids: None,
                     token_ids: raw_token_ids,
                     block_size,
                     medium,

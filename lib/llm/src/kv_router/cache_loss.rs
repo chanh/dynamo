@@ -1452,6 +1452,12 @@ fn cache_group_hashes(
     cache_namespace: Option<&str>,
 ) -> Option<Vec<CacheGroupHashSequence>> {
     let mut groups = Vec::with_capacity(catalog.len());
+    let eagle_block_sizes: HashSet<_> = catalog
+        .iter()
+        .filter(|group| group.is_eagle)
+        .map(|group| group.block_size)
+        .collect();
+    let mut ordinary_block_hashes: HashMap<u32, Vec<u64>> = HashMap::new();
     for group in catalog {
         let kind = match group.kind.as_str() {
             "full_attention" | "mla_attention" | "sink_full_attention" => {
@@ -1476,6 +1482,39 @@ fn cache_group_hashes(
             hashed = hashed.with_cache_namespace(cache_namespace.to_string());
         }
         let sequence_hashes = hashed.get_or_compute_seq_hashes().to_vec();
+        let eagle_lookahead_block_hashes = if group.is_eagle {
+            if let Some(hashes) = ordinary_block_hashes.get(&group.block_size) {
+                hashes.clone()
+            } else {
+                let mut ordinary = TokensWithHashes::new(tokens.to_vec(), group.block_size);
+                if let Some(lora_name) = lora_name {
+                    ordinary = ordinary.with_lora_name(lora_name.to_string());
+                }
+                if let Some(cache_namespace) = cache_namespace {
+                    ordinary = ordinary.with_cache_namespace(cache_namespace.to_string());
+                }
+                let hashes = ordinary
+                    .get_or_compute_block_hashes()
+                    .iter()
+                    .map(|hash| hash.0)
+                    .collect::<Vec<_>>();
+                ordinary_block_hashes.insert(group.block_size, hashes.clone());
+                hashes
+            }
+        } else {
+            if eagle_block_sizes.contains(&group.block_size) {
+                ordinary_block_hashes
+                    .entry(group.block_size)
+                    .or_insert_with(|| {
+                        hashed
+                            .get_or_compute_block_hashes()
+                            .iter()
+                            .map(|hash| hash.0)
+                            .collect()
+                    });
+            }
+            Vec::new()
+        };
         groups.push(CacheGroupHashSequence {
             group_idx: group.group_idx,
             kind,
@@ -1484,6 +1523,7 @@ fn cache_group_hashes(
             is_eagle: group.is_eagle,
             alignment_tokens,
             sequence_hashes,
+            eagle_lookahead_block_hashes,
         });
     }
     Some(groups)
@@ -2520,6 +2560,7 @@ async fn run_cache_evidence_subscriber(
                                     blocks,
                                     ..
                                 } => !blocks.is_empty(),
+                                CacheEvidenceMutation::StoreEagleLookahead { .. } => true,
                                 CacheEvidenceMutation::Remove { block_hashes, .. } => {
                                     !block_hashes.is_empty()
                                 }
@@ -2553,7 +2594,8 @@ async fn run_cache_evidence_subscriber(
                     for mutation in &batch.mutations {
                         match mutation {
                             CacheEvidenceMutation::Store { tier, .. }
-                            | CacheEvidenceMutation::StoreWithParentAttestation { tier, .. } => {
+                            | CacheEvidenceMutation::StoreWithParentAttestation { tier, .. }
+                            | CacheEvidenceMutation::StoreEagleLookahead { tier, .. } => {
                                 metrics.observe_mutation("store", cache_tier_label(*tier));
                             }
                             CacheEvidenceMutation::Remove { tier, .. } => {
@@ -2865,6 +2907,9 @@ mod tests {
             parent_block_hash: None,
             parent_sequence_hash: None,
             parent_sequence_hash_algorithm: None,
+            eagle_lookahead_sequence_hash: None,
+            eagle_lookahead_sequence_hash_algorithm: None,
+            eagle_lookahead_token_ids: None,
             token_ids: vec![1, 2],
             block_size: 2,
             medium: Some(medium.to_string()),

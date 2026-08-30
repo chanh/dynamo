@@ -129,6 +129,12 @@ pub enum RawKvEvent {
         parent_sequence_hash: Option<BlockHashValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_sequence_hash_algorithm: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eagle_lookahead_sequence_hash: Option<BlockHashValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eagle_lookahead_sequence_hash_algorithm: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eagle_lookahead_token_ids: Option<Vec<u32>>,
         token_ids: Vec<u32>,
         block_size: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
