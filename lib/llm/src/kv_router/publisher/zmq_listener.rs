@@ -1258,6 +1258,132 @@ mod tests {
     }
 
     #[test]
+    fn live_n513_sparse_eagle_wire_preserves_gpu_cpu_mapping() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let encoded = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("fixtures/live_n513_gpu_cpu.msgpack.b64").trim())
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&encoded)),
+            "8b39fa9e476d3f3d5089a0bc23f52215fa3cd4c7de848cce6d7d0ff602b5f9a8"
+        );
+        let batch: KvEventBatch = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(batch.events.len(), 3);
+        assert!(matches!(
+            &batch.events[0],
+            RawKvEvent::BlockStored { block_hashes, group_idx: Some(2), medium: Some(medium), .. }
+                if block_hashes.len() == 3 && medium == "GPU"
+        ));
+        assert!(matches!(
+            &batch.events[1],
+            RawKvEvent::BlockStored { block_hashes, group_idx: Some(2), medium: Some(medium), .. }
+                if block_hashes.len() == 2 && medium == "GPU"
+        ));
+
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let mut resolver = EvidenceHashResolver::new(MAX_EVIDENCE_HASH_MAPPINGS);
+        let mutations: Vec<_> = batch
+            .events
+            .iter()
+            .map(|event| {
+                cache_evidence_mutation_with_resolver(
+                    event,
+                    TEST_OWNER,
+                    None,
+                    &warning_count,
+                    &mut resolver,
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect();
+        let (external_hash, local_hash, parent_sequence_hash) = match &mutations[2] {
+            CacheEvidenceMutation::StoreWithParentAttestation {
+                blocks,
+                parent_sequence_hash,
+                ..
+            } => {
+                assert_eq!(blocks.len(), 1);
+                (
+                    blocks[0].external_hash,
+                    blocks[0].tokens_hash,
+                    *parent_sequence_hash,
+                )
+            }
+            mutation => panic!("unexpected CPU mutation: {mutation:?}"),
+        };
+        let gpu_match = match &mutations[1] {
+            CacheEvidenceMutation::StoreWithParentAttestation { blocks, .. } => blocks
+                .iter()
+                .find(|block| block.external_hash == external_hash)
+                .copied(),
+            mutation => panic!("unexpected GPU mutation: {mutation:?}"),
+        };
+        assert_eq!(gpu_match.unwrap().tokens_hash, local_hash);
+        let canonical_hash =
+            compute_next_seq_hash(parent_sequence_hash, LocalBlockHash(local_hash));
+
+        let mut ledger = CacheEvidenceLedger::new(64);
+        ledger.record_group_catalog(TEST_OWNER, CacheTier::Gpu, [2]);
+        ledger.record_group_catalog(TEST_OWNER, CacheTier::Cpu, [2]);
+        ledger.seal_physical_scope();
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+            owner: TEST_OWNER,
+            source_cursor: 1,
+            source_incarnation_id: None,
+            heartbeat: false,
+            watermark_source_cursor: None,
+            mutations,
+            barrier_id: None,
+            epoch_id: None,
+            telemetry_complete: true,
+        });
+        assert!(result.is_complete());
+        assert_eq!(
+            ledger.resident_on(canonical_hash, TEST_OWNER),
+            KnownBool::Yes
+        );
+
+        for (source_cursor, medium, expected) in
+            [(2, "GPU", KnownBool::Yes), (3, "CPU", KnownBool::No)]
+        {
+            let remove = RawKvEvent::BlockRemoved {
+                block_hashes: vec![BlockHashValue::Unsigned(external_hash)],
+                medium: Some(medium.to_string()),
+                group_idx: Some(2),
+                kv_cache_spec_kind: None,
+                kv_cache_spec_sliding_window: None,
+                locality: None,
+                ownership: None,
+            };
+            let mutation = cache_evidence_mutation_with_resolver(
+                &remove,
+                TEST_OWNER,
+                None,
+                &warning_count,
+                &mut resolver,
+            )
+            .unwrap()
+            .unwrap();
+            let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+                owner: TEST_OWNER,
+                source_cursor,
+                source_incarnation_id: None,
+                heartbeat: false,
+                watermark_source_cursor: None,
+                mutations: vec![mutation],
+                barrier_id: None,
+                epoch_id: None,
+                telemetry_complete: true,
+            });
+            assert!(result.is_complete());
+            assert_eq!(ledger.resident_on(canonical_hash, TEST_OWNER), expected);
+        }
+    }
+
+    #[test]
     fn constituent_events_preserve_hybrid_prefix_and_duplicate_refcounts() {
         const HBF: usize = 3;
         const FULL_BLOCK_SIZE: usize = 256;
