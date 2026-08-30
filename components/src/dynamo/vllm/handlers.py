@@ -3492,6 +3492,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         logger.debug(f"Decode Request ID: {request_id}")
         self._multimodal_request_processor.validate_multimodal_request(request)
         first_token = True
+        exhausted = False
         try:
             with time_and_log_code_section(
                 f"[DECODE] request: {request_id} generate"
@@ -3508,8 +3509,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         decode_timer.stop_interval()
                         first_token = False
                     yield chunk
+                exhausted = True
         finally:
-            self._finish_prompt_source_request(request_id)
+            if exhausted:
+                self._finish_prompt_source_request(request_id)
+            else:
+                self._mark_prompt_source_cancelled(request_id)
 
     async def _assemble_custom_encoder_prompt(
         self,

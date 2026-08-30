@@ -2156,6 +2156,84 @@ def test_terminal_prompt_source_origin_registry_is_bounded():
     assert list(handler._prompt_source_active_origins) == ["two", "three"]
 
 
+def _prompt_source_context(request_id: str = "request-1") -> MagicMock:
+    context = MagicMock()
+    context.id.return_value = request_id
+    context.metadata = {
+        "dynamo-prompt-source-origin-router-id": "17",
+        "dynamo-prompt-source-registration-nonce": "23",
+    }
+    return context
+
+
+async def _passthrough(generator):
+    async for chunk in generator:
+        yield chunk
+
+
+def _prompt_source_decode_handler(monkeypatch) -> mod.DecodeWorkerHandler:
+    handler = _make_decode_handler(disaggregation_mode="AGGREGATED")
+    handler.use_vllm_tokenizer = False
+    handler._prompt_source_publisher = MagicMock()
+    handler._prompt_source_active_origins = mod.OrderedDict()
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+    handler._multimodal_request_processor.validate_multimodal_request = MagicMock()
+    monkeypatch.setattr(mod, "_translate_vllm_client_errors", _passthrough)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_dropped_decode_generator_keeps_origin_until_terminal_outcome(
+    monkeypatch,
+):
+    handler = _prompt_source_decode_handler(monkeypatch)
+
+    async def suspended_generation(*_args):
+        yield {"token_ids": [4, 5]}
+        await asyncio.Future()
+
+    handler._generate_token_mode = suspended_generation
+    generator = handler.generate({}, _prompt_source_context())
+
+    assert await anext(generator) == {"token_ids": [4, 5]}
+    await generator.aclose()
+    assert "request-1" not in handler._prompt_source_active_origins
+    assert "request-1" in handler._prompt_source_pending_origins
+
+    handler._publish_prompt_source_outcome(
+        SimpleNamespace(
+            request_id="request-1",
+            complete=False,
+            num_prompt_tokens=3,
+            incomplete_reason="cancelled",
+            num_computed_output_tokens=2,
+            num_unobserved_computed_output_tokens=0,
+            generated_history_incomplete_reason=None,
+        )
+    )
+
+    assert "request-1" not in handler._prompt_source_pending_origins
+    payload = handler._prompt_source_publisher.publish.call_args.args[0]
+    assert payload["origin_router_id"] == 17
+    handler._prompt_source_publisher.observe_control_result.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_decode_generator_removes_active_origin(monkeypatch):
+    handler = _prompt_source_decode_handler(monkeypatch)
+
+    async def completed_generation(*_args):
+        yield {"token_ids": [4, 5]}
+
+    handler._generate_token_mode = completed_generation
+
+    assert [
+        chunk async for chunk in handler.generate({}, _prompt_source_context())
+    ] == [{"token_ids": [4, 5]}]
+    assert not handler._prompt_source_active_origins
+    assert not handler._prompt_source_pending_origins
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
