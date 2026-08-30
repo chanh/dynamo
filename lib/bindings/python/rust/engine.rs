@@ -155,7 +155,7 @@ mod close_on_drop_tests {
     }
 
     #[tokio::test]
-    async fn dropping_after_ready_item_closes_python_generator() -> PyResult<()> {
+    async fn dropping_direct_stream_after_ready_item_closes_python_generator() -> PyResult<()> {
         pyo3::prepare_freethreaded_python();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let loop_thread = thread::spawn(move || -> PyResult<()> {
@@ -167,12 +167,15 @@ mod close_on_drop_tests {
                     py,
                     &CString::new(
                         r#"
+import asyncio
+
 closed = False
 
 async def generate():
     global closed
     try:
         yield 1
+        await asyncio.Event().wait()
         yield 2
     finally:
         closed = True
@@ -199,13 +202,16 @@ async def generate():
             .recv_timeout(Duration::from_secs(2))
             .expect("Python event loop must start");
         let locals = Python::with_gil(|py| TaskLocals::new(event_loop.bind(py).clone()));
-        let mut stream = Python::with_gil(|py| {
+        let stream = Python::with_gil(|py| {
             demand_driven_python_stream(locals, generator.bind(py).clone())
         })?;
+        let mut direct_stream = DirectPythonResponseStream {
+            stream: Some(stream),
+            exhausted: false,
+        };
 
-        let first = stream.next().await.expect("first item must be ready")?;
-        assert_eq!(Python::with_gil(|py| first.bind(py).extract::<u64>())?, 1);
-        drop(stream);
+        assert!(direct_stream.next().await.is_some());
+        drop(direct_stream);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let closed = loop {
@@ -736,8 +742,8 @@ where
 
 fn unbuffered_python_response_stream(
     stream: PyItemStream,
-    ctx: Arc<dyn AsyncEngineContext>,
-    request_id: String,
+    _ctx: Arc<dyn AsyncEngineContext>,
+    _request_id: String,
 ) -> DataStream<PythonResponseItem> {
     // Do not poll the generator again until ingress has encoded the current
     // Python object. A generator may reuse and mutate the same dict/list for
@@ -745,23 +751,18 @@ fn unbuffered_python_response_stream(
     // observe those later mutations.
     Box::pin(DirectPythonResponseStream {
         stream: Some(stream),
-        ctx,
-        request_id,
         exhausted: false,
     })
 }
 
 /// Demand-driven network response stream with cooperative Python cancellation.
 ///
-/// Ingress stops the request context when the client response connection
-/// closes, then drops this stream. Give the Python generator one final poll so
-/// it can observe `context.is_stopped()` and run its cancellation path. Normal
-/// response delivery remains unbuffered: the next generator item is not polled
-/// until ingress has encoded the current one.
+/// Dropping this stream immediately drops its Python item stream, whose close
+/// guard schedules the generator's `aclose()`. Normal response delivery remains
+/// unbuffered: the next generator item is not polled until ingress has encoded
+/// the current one.
 struct DirectPythonResponseStream {
     stream: Option<PyItemStream>,
-    ctx: Arc<dyn AsyncEngineContext>,
-    request_id: String,
     exhausted: bool,
 }
 
@@ -790,31 +791,6 @@ impl Stream for DirectPythonResponseStream {
             }
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-impl Drop for DirectPythonResponseStream {
-    fn drop(&mut self) {
-        if self.exhausted || !self.ctx.is_stopped() {
-            return;
-        }
-
-        let Some(mut stream) = self.stream.take() else {
-            return;
-        };
-        let request_id = self.request_id.clone();
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        runtime.spawn(async move {
-            // Cooperative Python generators inspect their Context when polled.
-            // Discard the result: the client has already dropped its stream.
-            let _ = stream.next().await;
-            tracing::trace!(
-                request_id,
-                "polled direct Python response generator after cancellation"
-            );
-        });
     }
 }
 
