@@ -31,6 +31,40 @@ pub enum KnownBool {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CacheEvidenceApplyIntegrityFailure {
+    IncompleteBatch,
+    MissingGroup,
+    MissingParent,
+    ConflictingMapping,
+}
+
+impl CacheEvidenceApplyIntegrityFailure {
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::IncompleteBatch => "incomplete_batch",
+            Self::MissingGroup => "missing_group",
+            Self::MissingParent => "missing_parent",
+            Self::ConflictingMapping => "conflicting_mapping",
+        }
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct CacheEvidenceApplyResult {
+    failures: HashSet<CacheEvidenceApplyIntegrityFailure>,
+}
+
+impl CacheEvidenceApplyResult {
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn failures(&self) -> impl Iterator<Item = CacheEvidenceApplyIntegrityFailure> + '_ {
+        self.failures.iter().copied()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum CacheEvidenceMutation {
@@ -345,6 +379,15 @@ impl CacheEvidenceLedger {
     /// Apply one transport batch after its publisher/source ordering has been
     /// validated by the subscriber.
     pub fn apply_evidence_batch(&mut self, batch: &CacheEvidenceBatch) -> bool {
+        self.apply_evidence_batch_with_diagnostics(batch)
+            .is_complete()
+    }
+
+    pub fn apply_evidence_batch_with_diagnostics(
+        &mut self,
+        batch: &CacheEvidenceBatch,
+    ) -> CacheEvidenceApplyResult {
+        let mut result = CacheEvidenceApplyResult::default();
         // Report this batch's integrity independently from cumulative stream
         // completeness. A verified cold epoch must be able to apply its clear
         // batches after an earlier gap, while the cumulative poison remains
@@ -353,6 +396,9 @@ impl CacheEvidenceLedger {
         self.physical_telemetry_complete = true;
         if !batch.telemetry_complete {
             self.mark_physical_telemetry_incomplete();
+            result
+                .failures
+                .insert(CacheEvidenceApplyIntegrityFailure::IncompleteBatch);
         }
 
         let mut store_run_start = None;
@@ -362,7 +408,7 @@ impl CacheEvidenceLedger {
                 continue;
             }
             if let Some(start) = store_run_start.take() {
-                self.apply_store_run(batch.owner, &batch.mutations[start..index]);
+                self.apply_store_run(batch.owner, &batch.mutations[start..index], &mut result);
             }
             match mutation {
                 CacheEvidenceMutation::Store { .. } => unreachable!("stores were handled above"),
@@ -373,6 +419,9 @@ impl CacheEvidenceLedger {
                 } => {
                     let Some(group) = *group_idx else {
                         self.mark_physical_telemetry_incomplete();
+                        result
+                            .failures
+                            .insert(CacheEvidenceApplyIntegrityFailure::MissingGroup);
                         continue;
                     };
                     for &hash in block_hashes {
@@ -386,11 +435,12 @@ impl CacheEvidenceLedger {
             }
         }
         if let Some(start) = store_run_start {
-            self.apply_store_run(batch.owner, &batch.mutations[start..]);
+            self.apply_store_run(batch.owner, &batch.mutations[start..], &mut result);
         }
         let batch_complete = self.physical_telemetry_complete;
         self.physical_telemetry_complete = prior_telemetry_complete && batch_complete;
-        batch_complete
+        debug_assert_eq!(batch_complete, result.is_complete());
+        result
     }
 
     /// Resolve the canonical sequence hashes changed by one mutation before it
@@ -459,7 +509,12 @@ impl CacheEvidenceLedger {
         }
     }
 
-    fn apply_store_run(&mut self, owner: CacheOwner, mutations: &[CacheEvidenceMutation]) {
+    fn apply_store_run(
+        &mut self,
+        owner: CacheOwner,
+        mutations: &[CacheEvidenceMutation],
+        result: &mut CacheEvidenceApplyResult,
+    ) {
         let mut ready = VecDeque::new();
         let mut waiting: HashMap<(u32, u64), Vec<&CacheEvidenceMutation>> = HashMap::new();
         for mutation in mutations {
@@ -473,6 +528,9 @@ impl CacheEvidenceLedger {
             };
             let Some(group) = *group_idx else {
                 self.mark_physical_telemetry_incomplete();
+                result
+                    .failures
+                    .insert(CacheEvidenceApplyIntegrityFailure::MissingGroup);
                 continue;
             };
             match parent_external_hash {
@@ -497,11 +555,35 @@ impl CacheEvidenceLedger {
             let Some(group) = *group_idx else {
                 unreachable!("invalid groups were rejected before queueing");
             };
-            if self.apply_store_mutation(owner, *tier, Some(group), *parent_external_hash, blocks)
-                != StoreMutationResult::Applied
-            {
-                self.mark_physical_telemetry_incomplete();
-                continue;
+            match self.apply_store_mutation(
+                owner,
+                *tier,
+                Some(group),
+                *parent_external_hash,
+                blocks,
+            ) {
+                StoreMutationResult::Applied => {}
+                StoreMutationResult::MissingParent => {
+                    self.mark_physical_telemetry_incomplete();
+                    result
+                        .failures
+                        .insert(CacheEvidenceApplyIntegrityFailure::MissingParent);
+                    continue;
+                }
+                StoreMutationResult::RejectedMapping => {
+                    self.mark_physical_telemetry_incomplete();
+                    result
+                        .failures
+                        .insert(CacheEvidenceApplyIntegrityFailure::ConflictingMapping);
+                    continue;
+                }
+                StoreMutationResult::Invalid => {
+                    self.mark_physical_telemetry_incomplete();
+                    result
+                        .failures
+                        .insert(CacheEvidenceApplyIntegrityFailure::MissingGroup);
+                    continue;
+                }
             }
             for block in blocks {
                 if let Some(dependents) = waiting.remove(&(group, block.external_hash)) {
@@ -511,6 +593,9 @@ impl CacheEvidenceLedger {
         }
         if !waiting.is_empty() {
             self.mark_physical_telemetry_incomplete();
+            result
+                .failures
+                .insert(CacheEvidenceApplyIntegrityFailure::MissingParent);
         }
     }
 
@@ -1609,7 +1694,7 @@ mod tests {
         });
         assert_eq!(ledger.resident_on(9, WORKER_A), KnownBool::Yes);
 
-        ledger.apply_evidence_batch(&CacheEvidenceBatch {
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
             owner: WORKER_A,
             source_cursor: 5,
             source_incarnation_id: None,
@@ -1624,7 +1709,32 @@ mod tests {
                 block_hashes: vec![9],
             }],
         });
+        assert_eq!(
+            result.failures().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::MissingGroup])
+        );
         assert_eq!(ledger.resident_on(10, WORKER_A), KnownBool::Unknown);
+    }
+
+    #[test]
+    fn incomplete_batch_reports_bounded_integrity_reason() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+            owner: WORKER_A,
+            source_cursor: 1,
+            source_incarnation_id: None,
+            barrier_id: None,
+            epoch_id: None,
+            heartbeat: false,
+            watermark_source_cursor: None,
+            telemetry_complete: false,
+            mutations: Vec::new(),
+        });
+
+        assert_eq!(
+            result.failures().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::IncompleteBatch])
+        );
     }
 
     #[test]
@@ -1815,7 +1925,7 @@ mod tests {
         ledger.record_group_catalog(WORKER_A, CacheTier::Cpu, [0]);
         ledger.seal_physical_scope();
 
-        ledger.apply_evidence_batch(&CacheEvidenceBatch {
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
             owner: WORKER_A,
             source_cursor: 1,
             source_incarnation_id: None,
@@ -1835,6 +1945,10 @@ mod tests {
             }],
         });
 
+        assert_eq!(
+            result.failures().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::MissingParent])
+        );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().cpu_physical_blocks, 0);
     }
@@ -2008,7 +2122,7 @@ mod tests {
         ledger.seal_physical_scope();
         ledger.store_mapped(WORKER_A, CacheTier::Cpu, 0, 101, 999);
 
-        ledger.apply_evidence_batch(&CacheEvidenceBatch {
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
             owner: WORKER_A,
             source_cursor: 1,
             source_incarnation_id: None,
@@ -2045,6 +2159,13 @@ mod tests {
             ],
         });
 
+        assert_eq!(
+            result.failures().collect::<HashSet<_>>(),
+            HashSet::from([
+                CacheEvidenceApplyIntegrityFailure::ConflictingMapping,
+                CacheEvidenceApplyIntegrityFailure::MissingParent,
+            ])
+        );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().cpu_physical_blocks, 1);
         assert!(!ledger.external_copies.keys().any(|(hash, _)| *hash == 100));
@@ -2060,7 +2181,7 @@ mod tests {
         ledger.store_mapped(WORKER_A, CacheTier::Gpu, 0, 100, 10);
         ledger.store_mapped(WORKER_A, CacheTier::Cpu, 0, 100, 11);
 
-        ledger.apply_evidence_batch(&CacheEvidenceBatch {
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
             owner: WORKER_A,
             source_cursor: 1,
             source_incarnation_id: None,
@@ -2080,6 +2201,10 @@ mod tests {
             }],
         });
 
+        assert_eq!(
+            result.failures().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceApplyIntegrityFailure::MissingParent])
+        );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().gpu_physical_blocks, 1);
         assert_eq!(ledger.stats().cpu_physical_blocks, 1);

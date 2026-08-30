@@ -75,6 +75,7 @@ const TARGET_ENDPOINT_LABEL: &str = "target_endpoint";
 pub(crate) struct CacheEvidenceMetrics {
     batches_total: IntCounterVec,
     mutations_total: IntCounterVec,
+    apply_integrity_failures_total: IntCounterVec,
     source_gaps_total: IntCounter,
     physical_blocks: IntGaugeVec,
     history_blocks: IntGauge,
@@ -119,6 +120,14 @@ impl CacheEvidenceMetrics {
                         labels,
                     )
                     .expect("cache evidence mutation metrics");
+                let apply_integrity_failures_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_evidence_apply_integrity_failures_total"),
+                        "Cache evidence apply integrity failures by bounded reason",
+                        &["reason"],
+                        labels,
+                    )
+                    .expect("cache evidence apply integrity failure metrics");
                 let source_gaps_total = metrics
                     .create_intcounter(
                         &router_metric("cache_loss_evidence_source_gaps_total"),
@@ -261,12 +270,21 @@ impl CacheEvidenceMetrics {
                         mutations_total.with_label_values(&[operation, tier]);
                     }
                 }
+                for reason in [
+                    "incomplete_batch",
+                    "missing_group",
+                    "missing_parent",
+                    "conflicting_mapping",
+                ] {
+                    apply_integrity_failures_total.with_label_values(&[reason]);
+                }
                 for tier in ["gpu", "cpu"] {
                     physical_blocks.with_label_values(&[tier]);
                 }
                 Arc::new(Self {
                     batches_total,
                     mutations_total,
+                    apply_integrity_failures_total,
                     source_gaps_total,
                     physical_blocks,
                     history_blocks,
@@ -300,6 +318,12 @@ impl CacheEvidenceMetrics {
     pub(crate) fn observe_mutation(&self, operation: &'static str, tier: &'static str) {
         self.mutations_total
             .with_label_values(&[operation, tier])
+            .inc();
+    }
+
+    pub(crate) fn observe_apply_integrity_failure(&self, reason: &'static str) {
+        self.apply_integrity_failures_total
+            .with_label_values(&[reason])
             .inc();
     }
 

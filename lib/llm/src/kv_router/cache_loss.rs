@@ -2559,13 +2559,18 @@ async fn run_cache_evidence_subscriber(
                             }
                         }
                     }
-                    if !state.apply_evidence_batch(&batch)
-                        && barrier_state
+                    let apply_result = state.apply_evidence_batch_with_diagnostics(&batch);
+                    if !apply_result.is_complete() {
+                        for failure in apply_result.failures() {
+                            metrics.observe_apply_integrity_failure(failure.metric_label());
+                        }
+                        if barrier_state
                             .fail_owner(batch.owner, "barrier_apply_integrity_failure")
                             > 0
-                    {
-                        cold_epoch.lock().fail("cold_epoch_apply_integrity_failure");
-                        metrics.observe_barrier_incomplete("apply_integrity_failure");
+                        {
+                            cold_epoch.lock().fail("cold_epoch_apply_integrity_failure");
+                            metrics.observe_barrier_incomplete("apply_integrity_failure");
+                        }
                     }
                     metrics.update_state(state.stats());
                     metrics.update_barrier_pending(barrier_state.pending);
