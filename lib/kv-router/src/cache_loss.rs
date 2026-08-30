@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::protocols::{LocalBlockHash, compute_next_seq_hash};
 
 pub const KV_CACHE_EVIDENCE_SUBJECT: &str = "kv-cache-evidence-events";
+const MAX_MISSING_PARENT_DIAGNOSTIC_KEYS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CacheOwner {
@@ -198,6 +199,8 @@ pub struct CacheEvidenceLedger {
     history_epoch: u64,
     copies: HashMap<(u64, PhysicalCopy), u32>,
     external_copies: HashMap<(u64, PhysicalCopy), (u64, u32)>,
+    seen_external_hashes: HashSet<(CacheOwner, u32, u64)>,
+    sampled_missing_parent_keys: HashSet<(CacheOwner, u32)>,
     required_groups: HashMap<(CacheOwner, CacheTier), BTreeSet<u32>>,
     expected_owners: Option<HashSet<CacheOwner>>,
     physical_scope_complete: bool,
@@ -219,6 +222,8 @@ impl CacheEvidenceLedger {
             history_epoch: 0,
             copies: HashMap::new(),
             external_copies: HashMap::new(),
+            seen_external_hashes: HashSet::with_capacity(history_capacity),
+            sampled_missing_parent_keys: HashSet::new(),
             required_groups: HashMap::new(),
             expected_owners: None,
             physical_scope_complete: false,
@@ -258,6 +263,8 @@ impl CacheEvidenceLedger {
     pub fn advance_history_epoch(&mut self) -> u64 {
         self.history_epoch = self.history_epoch.wrapping_add(1).max(1);
         self.seen_blocks.clear();
+        self.seen_external_hashes.clear();
+        self.sampled_missing_parent_keys.clear();
         self.history_saturated = false;
         self.history_complete = true;
         self.physical_telemetry_complete = true;
@@ -592,6 +599,17 @@ impl CacheEvidenceLedger {
             }
         }
         if !waiting.is_empty() {
+            for ((group, parent_external_hash), dependents) in &waiting {
+                if let Some(mutation) = dependents.first() {
+                    self.sample_missing_parent(
+                        owner,
+                        *group,
+                        *parent_external_hash,
+                        mutation,
+                        mutations,
+                    );
+                }
+            }
             self.mark_physical_telemetry_incomplete();
             result
                 .failures
@@ -643,6 +661,91 @@ impl CacheEvidenceLedger {
             debug_assert!(applied, "store mapping was validated before mutation");
         }
         StoreMutationResult::Applied
+    }
+
+    fn sample_missing_parent(
+        &mut self,
+        owner: CacheOwner,
+        group: u32,
+        parent_external_hash: u64,
+        mutation: &CacheEvidenceMutation,
+        store_run: &[CacheEvidenceMutation],
+    ) {
+        let sample_key = (owner, group);
+        if self.sampled_missing_parent_keys.contains(&sample_key)
+            || self.sampled_missing_parent_keys.len() >= MAX_MISSING_PARENT_DIAGNOSTIC_KEYS
+        {
+            return;
+        }
+        self.sampled_missing_parent_keys.insert(sample_key);
+
+        let CacheEvidenceMutation::Store { tier, blocks, .. } = mutation else {
+            return;
+        };
+        let present_gpu = self.external_copies.contains_key(&(
+            parent_external_hash,
+            PhysicalCopy {
+                owner,
+                tier: CacheTier::Gpu,
+                group,
+            },
+        ));
+        let present_cpu = self.external_copies.contains_key(&(
+            parent_external_hash,
+            PhysicalCopy {
+                owner,
+                tier: CacheTier::Cpu,
+                group,
+            },
+        ));
+        let present_other_group = self.external_copies.keys().any(|(external, copy)| {
+            *external == parent_external_hash && copy.owner == owner && copy.group != group
+        });
+        let ever_seen_same_group =
+            self.seen_external_hashes
+                .contains(&(owner, group, parent_external_hash));
+        let ever_seen_other_group =
+            self.seen_external_hashes
+                .iter()
+                .any(|(seen_owner, seen_group, external)| {
+                    *seen_owner == owner
+                        && *seen_group != group
+                        && *external == parent_external_hash
+                });
+        let parent_emitted_in_store_run = store_run.iter().any(|candidate| {
+            matches!(
+                candidate,
+                CacheEvidenceMutation::Store {
+                    group_idx: Some(candidate_group),
+                    blocks,
+                    ..
+                } if *candidate_group == group
+                    && blocks.iter().any(|block| block.external_hash == parent_external_hash)
+            )
+        });
+        let store_run_index = store_run
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, mutation));
+        tracing::warn!(
+            target: "dynamo_kv_cache_loss",
+            worker_id = owner.worker_id,
+            dp_rank = owner.dp_rank,
+            group_idx = group,
+            tier = ?tier,
+            parent_external_hash,
+            first_child_external_hash = blocks.first().map(|block| block.external_hash),
+            first_child_tokens_hash = blocks.first().map(|block| block.tokens_hash),
+            child_block_count = blocks.len(),
+            store_run_len = store_run.len(),
+            store_run_index,
+            present_gpu,
+            present_cpu,
+            present_other_group,
+            ever_seen_same_group,
+            ever_seen_other_group,
+            parent_emitted_in_store_run,
+            "sampled unresolved cache-evidence Store parent"
+        );
     }
 
     fn parent_sequence_hash(
@@ -703,6 +806,10 @@ impl CacheEvidenceLedger {
             .entry((external_hash, copy))
             .or_insert((sequence_hash, 0));
         external.1 = external.1.saturating_add(1);
+        if self.seen_external_hashes.len() < self.history_capacity {
+            self.seen_external_hashes
+                .insert((owner, group, external_hash));
+        }
         let count = self.copies.entry((sequence_hash, copy)).or_default();
         *count = count.saturating_add(1);
         // Store events include generated blocks as they become complete. They
@@ -752,6 +859,10 @@ impl CacheEvidenceLedger {
         self.copies.retain(|(_, copy), _| copy.owner != owner);
         self.external_copies
             .retain(|(_, copy), _| copy.owner != owner);
+        self.seen_external_hashes
+            .retain(|(seen_owner, _, _)| *seen_owner != owner);
+        self.sampled_missing_parent_keys
+            .retain(|(sampled_owner, _)| *sampled_owner != owner);
     }
 
     pub fn clear_owner_tier(&mut self, owner: CacheOwner, tier: CacheTier) {
@@ -1951,6 +2062,53 @@ mod tests {
         );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().cpu_physical_blocks, 0);
+    }
+
+    #[test]
+    fn missing_parent_diagnostics_are_once_per_owner_group_and_globally_bounded() {
+        let mut ledger = CacheEvidenceLedger::new(128);
+        let mutation = CacheEvidenceMutation::Store {
+            tier: CacheTier::Cpu,
+            group_idx: Some(0),
+            parent_external_hash: Some(100),
+            blocks: vec![CacheEvidenceStoredBlock {
+                external_hash: 101,
+                tokens_hash: 20,
+            }],
+        };
+        let store_run = [mutation.clone()];
+
+        ledger.sample_missing_parent(WORKER_A, 0, 100, &mutation, &store_run);
+        ledger.sample_missing_parent(WORKER_A, 0, 100, &mutation, &store_run);
+        assert_eq!(ledger.sampled_missing_parent_keys.len(), 1);
+
+        for worker_id in 1..=(MAX_MISSING_PARENT_DIAGNOSTIC_KEYS as u64 + 1) {
+            ledger.sample_missing_parent(
+                CacheOwner {
+                    worker_id,
+                    dp_rank: 0,
+                },
+                1,
+                100,
+                &mutation,
+                &store_run,
+            );
+        }
+        assert_eq!(
+            ledger.sampled_missing_parent_keys.len(),
+            MAX_MISSING_PARENT_DIAGNOSTIC_KEYS
+        );
+    }
+
+    #[test]
+    fn diagnostic_external_history_survives_remove_but_resets_with_owner() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.store_mapped(WORKER_A, CacheTier::Gpu, 0, 100, 10);
+        ledger.remove_external(WORKER_A, CacheTier::Gpu, 0, 100);
+        assert!(ledger.seen_external_hashes.contains(&(WORKER_A, 0, 100)));
+
+        ledger.clear_owner(WORKER_A);
+        assert!(!ledger.seen_external_hashes.contains(&(WORKER_A, 0, 100)));
     }
 
     #[test]
