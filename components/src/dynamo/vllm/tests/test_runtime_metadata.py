@@ -6,14 +6,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
-
 from dynamo.common.token_budget import TOKEN_BUDGET_RUNTIME_KEY
 from dynamo.llm import ModelInput, ModelType, WorkerType
 from dynamo.vllm.cache_info import (
     CACHE_EVIDENCE_BARRIER_CAPABILITY,
+    CACHE_EVIDENCE_CACHE_GROUP_CATALOGS,
     CACHE_EVIDENCE_EPOCH_CAPABILITY,
     CACHE_EVIDENCE_EPOCH_MEDIA,
     CACHE_EVIDENCE_SERVING_INCARNATIONS,
+    DYNAMO_KV_CACHE_GROUP_METADATA_KEY,
+    configure_kv_event_block_size,
+    get_common_cache_group_metadata,
     publish_cache_evidence_barrier_capability,
 )
 from dynamo.vllm.capacity import get_metrics_model_name, get_spec_decode_runtime_data
@@ -57,6 +60,119 @@ def test_metrics_model_name_falls_back_to_model():
     config = SimpleNamespace(model="meta-llama/Llama-3.1-8B", served_model_name=None)
 
     assert get_metrics_model_name(config) == "meta-llama/Llama-3.1-8B"
+
+
+@pytest.mark.asyncio
+async def test_cache_group_metadata_is_retained_and_attested_per_global_dp_rank(
+    monkeypatch,
+):
+    monkeypatch.setenv("DYN_CACHE_LOSS_FUNNEL_ENABLED", "true")
+    groups = [
+        {
+            "group_idx": 1,
+            "kind": "sliding_window",
+            "block_size": 256,
+            "sliding_window": 4096,
+            "is_eagle": False,
+            "alignment_tokens": 512,
+        },
+        {
+            "group_idx": 0,
+            "kind": "mla_attention",
+            "block_size": 256,
+            "sliding_window": None,
+            "is_eagle": False,
+            "alignment_tokens": 512,
+        },
+    ]
+    engine_core = SimpleNamespace(
+        _cache_evidence_engine=Mock(side_effect=lambda rank: f"engine-{rank}"),
+        _call_utility_async=AsyncMock(side_effect=[groups, groups]),
+    )
+    engine = SimpleNamespace(
+        engine_core=engine_core,
+        cache_evidence_barrier=Mock(),
+        cache_evidence_barrier_supported=AsyncMock(side_effect=[True, True]),
+        cache_evidence_serving_incarnation=AsyncMock(side_effect=[101, 2**63 + 123]),
+    )
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        cache_config=SimpleNamespace(block_size=16),
+        parallel_config=SimpleNamespace(
+            data_parallel_external_lb=False,
+            data_parallel_hybrid_lb=True,
+            data_parallel_rank=4,
+            data_parallel_size_local=2,
+        ),
+    )
+
+    assert await configure_kv_event_block_size(engine, vllm_config) == 256
+    normalized = [
+        {
+            "group_idx": 0,
+            "kind": "mla_attention",
+            "block_size": 256,
+            "is_eagle": False,
+            "alignment_tokens": 512,
+        },
+        {
+            "group_idx": 1,
+            "kind": "sliding_window",
+            "block_size": 256,
+            "is_eagle": False,
+            "sliding_window": 4096,
+            "alignment_tokens": 512,
+        },
+    ]
+    assert vllm_config.additional_config[DYNAMO_KV_CACHE_GROUP_METADATA_KEY] == {
+        "4": normalized,
+        "5": normalized,
+    }
+    assert get_common_cache_group_metadata(vllm_config) == normalized
+    assert engine_core._call_utility_async.call_args_list == [
+        call("get_kv_cache_group_metadata", engine="engine-4"),
+        call("get_kv_cache_group_metadata", engine="engine-5"),
+    ]
+
+    runtime_config = SimpleNamespace(set_engine_specific=Mock())
+    engine_args = SimpleNamespace(
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq")
+    )
+    assert await publish_cache_evidence_barrier_capability(
+        runtime_config, engine, engine_args, True, (4, 2), vllm_config
+    )
+    published = {
+        key: json.loads(value)
+        for key, value in (
+            entry.args for entry in runtime_config.set_engine_specific.call_args_list
+        )
+    }
+    assert published[CACHE_EVIDENCE_CACHE_GROUP_CATALOGS] == {
+        "4": {"serving_incarnation": "101", "cache_groups": normalized},
+        "5": {
+            "serving_incarnation": str(2**63 + 123),
+            "cache_groups": normalized,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_empty_cache_group_metadata_omits_attestation():
+    engine = SimpleNamespace(
+        engine_core=SimpleNamespace(call_utility_async=AsyncMock(return_value=[]))
+    )
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        cache_config=SimpleNamespace(block_size=16),
+        parallel_config=SimpleNamespace(
+            data_parallel_external_lb=True,
+            data_parallel_hybrid_lb=False,
+            data_parallel_rank=0,
+        ),
+    )
+
+    assert await configure_kv_event_block_size(engine, vllm_config) == 16
+    assert DYNAMO_KV_CACHE_GROUP_METADATA_KEY not in vllm_config.additional_config
 
 
 def test_vllm_token_budget_matches_rejection_policy():

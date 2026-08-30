@@ -89,6 +89,7 @@ from dynamo.vllm.router_hints import enable_router_hint_support
 
 from .args import Config
 from .cache_info import (
+    get_common_cache_group_metadata,
     get_configured_kv_event_block_size,
     publish_cache_evidence_barrier_capability,
 )
@@ -1115,6 +1116,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     _PROMPT_SOURCE_REGISTRATION_NONCE_KEY = "dynamo-prompt-source-registration-nonce"
     _PROMPT_SOURCE_ORIGIN_CAPACITY = 4096
     _PROMPT_SOURCE_ORIGIN_TTL_S = 60.0
+    _prompt_source_cache_groups: list[dict[str, Any]] | None = None
 
     @property
     def loaded_loras(self) -> dict[str, LoRAInfo]:
@@ -1142,6 +1144,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     ):
         self.runtime = runtime
         self.engine_client = engine
+        self._prompt_source_cache_groups = get_common_cache_group_metadata(
+            engine.vllm_config
+        )
         self.default_sampling_params = default_sampling_params
         self.kv_publishers: list[KvEventPublisher] | None = None
         self.fpm_relays: list | None = None
@@ -1356,6 +1361,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             else:
                 reason = outcome.incomplete_reason
             cache_source["incomplete_reason"] = reason
+        cache_groups = self._prompt_source_cache_groups
+        if cache_groups is not None:
+            cache_source["cache_groups"] = cache_groups
         publisher.publish(
             {
                 "origin_router_id": origin_router_id,
@@ -2552,6 +2560,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             self.config.engine_args,
             bool(getattr(self.config, "use_kv_events", False)),
             self.dp_range,
+            self.engine_client.vllm_config,
         )
         runtime_config.context_length = self.model_max_len
         publish_vllm_token_budget(runtime_config, self.model_max_len)

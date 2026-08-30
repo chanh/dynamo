@@ -752,6 +752,7 @@ async def register_vllm_model(
         config.engine_args,
         bool(config.use_kv_events),
         dp_range,
+        vllm_config,
     )
     runtime_config.context_length = vllm_config.model_config.max_model_len
     if publish_engine_generate_capability(

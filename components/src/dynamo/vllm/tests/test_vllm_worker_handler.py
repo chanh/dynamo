@@ -2177,6 +2177,51 @@ def test_vllm_error_preserves_terminal_retrieval_failure_attribution():
     publisher.observe_control_result.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("complete", "incomplete_reason"),
+    [(True, None), (False, "cancelled_before_prompt_complete")],
+    ids=("complete", "cancelled"),
+)
+def test_terminal_prompt_source_outcome_carries_retained_cache_groups(
+    complete, incomplete_reason
+):
+    groups = [
+        {
+            "group_idx": 0,
+            "kind": "mla_attention",
+            "block_size": 256,
+            "is_eagle": False,
+            "alignment_tokens": 512,
+        }
+    ]
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    handler._prompt_source_cache_groups = groups
+    handler._prompt_source_publisher = MagicMock()
+    handler._prompt_source_active_origins = mod.OrderedDict(
+        [("request-1", (17, 23, mod.time.monotonic()))]
+    )
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+    outcome = SimpleNamespace(
+        request_id="request-1",
+        complete=complete,
+        num_prompt_tokens=100,
+        num_local_cached_tokens=20,
+        num_external_cached_tokens=30,
+        num_external_lookup_tokens=35,
+        num_external_retrieval_failure_tokens=5,
+        num_computed_tokens=50,
+        incomplete_reason=incomplete_reason,
+        num_computed_output_tokens=7,
+        num_unobserved_computed_output_tokens=1,
+        generated_history_incomplete_reason=None,
+    )
+
+    handler._publish_prompt_source_outcome(outcome)
+
+    payload = handler._prompt_source_publisher.publish.call_args.args[0]
+    assert payload["cache_source"]["cache_groups"] == groups
+
+
 def test_terminal_prompt_source_origin_registry_is_bounded():
     handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
     handler._prompt_source_publisher = None
