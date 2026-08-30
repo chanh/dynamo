@@ -208,6 +208,39 @@ impl ColdEpochCoordinator {
         Self::finish_if_ready(round);
     }
 
+    fn accepts_clear_baseline(&self, batch: &CacheEvidenceBatch) -> bool {
+        let Some(epoch_id) = batch.epoch_id.as_deref() else {
+            return false;
+        };
+        let Some(round) = self
+            .active
+            .as_ref()
+            .filter(|round| round.epoch_id == epoch_id)
+        else {
+            return false;
+        };
+        let Some(progress) = round.owners.get(&batch.owner) else {
+            return false;
+        };
+        if batch.barrier_id.is_some()
+            || !batch.telemetry_complete
+            || batch.source_incarnation_id != Some(progress.fence.evidence_incarnation)
+            || progress.clear_cursor.is_some()
+            || batch.mutations.len() != progress.fence.expected_tiers.len()
+        {
+            return false;
+        }
+        let tiers: HashSet<_> = batch
+            .mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                CacheEvidenceMutation::Clear { tier: Some(tier) } => Some(*tier),
+                _ => None,
+            })
+            .collect();
+        tiers == progress.fence.expected_tiers && tiers.len() == batch.mutations.len()
+    }
+
     fn observe_clear_batch(&mut self, batch: &CacheEvidenceBatch) -> bool {
         let Some(epoch_id) = batch.epoch_id.as_deref() else {
             return false;
@@ -584,11 +617,22 @@ struct EvidenceSequenceTracker {
 }
 
 impl EvidenceSequenceTracker {
+    #[cfg(test)]
     fn observe(
         &mut self,
         owner: CacheOwner,
         publisher_id: u64,
         source_cursor: u64,
+    ) -> EvidenceSequenceObservation {
+        self.observe_with_initial_baseline(owner, publisher_id, source_cursor, false)
+    }
+
+    fn observe_with_initial_baseline(
+        &mut self,
+        owner: CacheOwner,
+        publisher_id: u64,
+        source_cursor: u64,
+        allow_initial_nonzero: bool,
     ) -> EvidenceSequenceObservation {
         let previous_publisher = self.owner_publishers.get(&owner).copied();
         let publisher_restarted =
@@ -610,7 +654,9 @@ impl EvidenceSequenceTracker {
                     EvidenceSequenceObservation::Gap
                 }
             }
-            None if source_cursor != 0 => EvidenceSequenceObservation::Gap,
+            None if source_cursor != 0 && !allow_initial_nonzero => {
+                EvidenceSequenceObservation::Gap
+            }
             None => EvidenceSequenceObservation::Contiguous,
         };
         if sequence_observation == EvidenceSequenceObservation::Stale {
@@ -2381,10 +2427,12 @@ async fn run_cache_evidence_subscriber(
                         update_freshness_metrics(&freshness, &metrics);
                         continue;
                     }
-                    let sequence_observation = source_sequences.observe(
+                    let accepts_clear_baseline = cold_epoch.lock().accepts_clear_baseline(&batch);
+                    let sequence_observation = source_sequences.observe_with_initial_baseline(
                         batch.owner,
                         source_incarnation_id,
                         batch.source_cursor,
+                        accepts_clear_baseline,
                     );
                     if sequence_observation == EvidenceSequenceObservation::PublisherRestart {
                         group_shapes.lock().remove(&batch.owner);
@@ -2888,6 +2936,80 @@ mod tests {
                 11,
                 3,
             ),
+            EvidenceSequenceObservation::Gap
+        );
+    }
+
+    #[test]
+    fn validated_cold_epoch_clear_can_baseline_an_unseen_publisher() {
+        let owner = barrier_owner(7);
+        let mut coordinator = ColdEpochCoordinator::default();
+        let outcome = coordinator
+            .begin(
+                "0123456789abcdef0123456789abcdef".to_string(),
+                41,
+                HashMap::from([(owner, epoch_fence(70))]),
+            )
+            .unwrap();
+        let mut clear = epoch_batch(
+            owner,
+            70,
+            None,
+            vec![
+                CacheEvidenceMutation::Clear {
+                    tier: Some(CacheTier::Gpu),
+                },
+                CacheEvidenceMutation::Clear {
+                    tier: Some(CacheTier::Cpu),
+                },
+            ],
+        );
+        clear.source_cursor = 50;
+        assert!(coordinator.accepts_clear_baseline(&clear));
+
+        let mut tracker = EvidenceSequenceTracker::default();
+        assert_eq!(
+            tracker.observe_with_initial_baseline(owner, 70, 50, true),
+            EvidenceSequenceObservation::Contiguous
+        );
+        assert!(coordinator.observe_clear_batch(&clear));
+
+        let mut marker = epoch_batch(owner, 70, Some(41), Vec::new());
+        marker.source_cursor = 51;
+        assert!(!coordinator.accepts_clear_baseline(&marker));
+        assert_eq!(
+            tracker.observe(owner, 70, 51),
+            EvidenceSequenceObservation::Contiguous
+        );
+        assert!(coordinator.observe_marker(&marker));
+        coordinator.controls_succeeded("0123456789abcdef0123456789abcdef");
+        assert_eq!(*outcome.borrow(), ColdEpochOutcome::EvidenceReady);
+    }
+
+    #[test]
+    fn invalid_epoch_clear_cannot_baseline_an_unseen_publisher() {
+        let owner = barrier_owner(7);
+        let mut coordinator = ColdEpochCoordinator::default();
+        coordinator
+            .begin(
+                "0123456789abcdef0123456789abcdef".to_string(),
+                41,
+                HashMap::from([(owner, epoch_fence(70))]),
+            )
+            .unwrap();
+        let mut missing_cpu = epoch_batch(
+            owner,
+            70,
+            None,
+            vec![CacheEvidenceMutation::Clear {
+                tier: Some(CacheTier::Gpu),
+            }],
+        );
+        missing_cpu.source_cursor = 50;
+
+        assert!(!coordinator.accepts_clear_baseline(&missing_cpu));
+        assert_eq!(
+            EvidenceSequenceTracker::default().observe_with_initial_baseline(owner, 70, 50, false,),
             EvidenceSequenceObservation::Gap
         );
     }
