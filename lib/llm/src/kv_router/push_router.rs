@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Arc,
+    time::Duration,
+};
 
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerWithDpRank},
@@ -69,11 +73,12 @@ fn route_target(worker: WorkerWithDpRank) -> AffinityTarget {
 fn monitor_response_stream<Sel>(
     mut response_stream: ManyOut<Annotated<LLMEngineOutput>>,
     context: Arc<dyn AsyncEngineContext>,
-    mut guard: RequestGuard<Sel>,
+    guard: RequestGuard<Sel>,
 ) -> impl futures::Stream<Item = Annotated<LLMEngineOutput>> + Send
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
+    let mut guard = CancelledStreamGuard::new(guard, Arc::clone(&context));
     async_stream::stream! {
         // Keep one cancellation future alive for the whole response stream. Calling
         // `stopped()` for every item repeatedly clones and polls a watch receiver.
@@ -114,6 +119,73 @@ where
         } else {
             guard.abort().await;
         }
+    }
+}
+
+struct CancelledStreamGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    guard: Option<RequestGuard<Sel>>,
+    context: Arc<dyn AsyncEngineContext>,
+}
+
+impl<Sel> CancelledStreamGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    fn new(guard: RequestGuard<Sel>, context: Arc<dyn AsyncEngineContext>) -> Self {
+        Self {
+            guard: Some(guard),
+            context,
+        }
+    }
+}
+
+impl<Sel> Deref for CancelledStreamGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    type Target = RequestGuard<Sel>;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("request guard already transferred")
+    }
+}
+
+impl<Sel> DerefMut for CancelledStreamGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("request guard already transferred")
+    }
+}
+
+impl<Sel> Drop for CancelledStreamGuard<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    fn drop(&mut self) {
+        if !self.context.is_stopped() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Some(mut guard) = self.guard.take() else {
+            return;
+        };
+        if !guard.begin_cancelled_drop_abort() {
+            return;
+        }
+        runtime.spawn(async move {
+            guard.abort().await;
+        });
     }
 }
 

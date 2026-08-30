@@ -323,6 +323,20 @@ impl CacheHistoryTracker {
         sequence.extend_from_slice(&output[..computed_output_tokens]);
         Ok(sequence)
     }
+
+    fn aborted_known_sequence(
+        &self,
+        computed_output_tokens: u64,
+        unobserved_computed_output_tokens: u64,
+        prompt_complete: bool,
+    ) -> Result<Vec<u32>, &'static str> {
+        let known_computed_output_tokens = computed_output_tokens
+            .checked_sub(unobserved_computed_output_tokens)
+            .ok_or("unobserved_output_exceeds_computed_output")?;
+        let known_computed_output_tokens = usize::try_from(known_computed_output_tokens)
+            .map_err(|_| "computed_output_exceeds_platform_size")?;
+        self.aborted_sequence(known_computed_output_tokens, prompt_complete)
+    }
 }
 
 /// Tracks when streamed output grows into a new scheduler accounting block.
@@ -394,6 +408,14 @@ impl<Sel> RequestGuard<Sel>
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
+    pub(super) fn begin_cancelled_drop_abort(&mut self) -> bool {
+        if self.terminal_lifecycle != RequestTerminalLifecycle::Open {
+            return false;
+        }
+        self.terminal_lifecycle = RequestTerminalLifecycle::Aborting;
+        true
+    }
+
     pub(super) fn new(
         chooser: Arc<KvRouter<Sel>>,
         request_metrics: Arc<RouterRequestMetrics>,
@@ -733,7 +755,6 @@ where
         computed_output_tokens: u64,
         unobserved_computed_output_tokens: u64,
         prompt_complete: bool,
-        incomplete_reason: Option<&str>,
     ) {
         let Some(history) = self.cache_history.as_mut() else {
             return;
@@ -742,22 +763,14 @@ where
             return;
         }
         history.finalized = true;
-        if unobserved_computed_output_tokens > 0 || incomplete_reason.is_some() {
-            self.cleanup
-                .chooser
-                .mark_cache_loss_history_incomplete_for_epoch(history.epoch);
-            return;
-        }
-        let Ok(computed_output_tokens) = usize::try_from(computed_output_tokens) else {
-            self.cleanup
-                .chooser
-                .mark_cache_loss_history_incomplete_for_epoch(history.epoch);
-            return;
-        };
-        let Ok(sequence) = history.aborted_sequence(computed_output_tokens, prompt_complete) else {
-            self.cleanup
-                .chooser
-                .mark_cache_loss_history_incomplete_for_epoch(history.epoch);
+        // Cancellation makes generated history optional, not globally incomplete.
+        // Retain the exact delivered/computed prefix and omit any worker-reported
+        // unobserved tail whose token identity is unavailable.
+        let Ok(sequence) = history.aborted_known_sequence(
+            computed_output_tokens,
+            unobserved_computed_output_tokens,
+            prompt_complete,
+        ) else {
             return;
         };
         self.cleanup.chooser.record_completed_token_history(
@@ -794,7 +807,6 @@ where
                     outcome.num_computed_output_tokens,
                     outcome.num_unobserved_computed_output_tokens,
                     outcome.cache_source.complete,
-                    outcome.generated_history_incomplete_reason.as_deref(),
                 );
                 self.observe_cache_loss_source(
                     outcome.cache_source,
@@ -815,12 +827,10 @@ where
         let Some(route) = self.cache_loss_route.take() else {
             return;
         };
-        if let Some(history) = self.cache_history.as_mut() {
-            self.cleanup
-                .chooser
-                .mark_cache_loss_history_incomplete_for_epoch(history.epoch);
-            history.finalized = true;
-        }
+        // A missing terminal join limits this cancellation observation, but the
+        // streamed prefix is still useful: every observed token except the last
+        // sampled token has been fed back through the model.
+        self.finalize_cache_history();
         self.cache_loss_recorded = true;
         let mut funnel = CacheLossFunnel::default();
         funnel.observe_incomplete(route.prompt_tokens);
@@ -910,5 +920,74 @@ mod cache_history_tests {
             tracker.completed_sequences().collect::<Vec<_>>(),
             vec![vec![1, 2, 3]]
         );
+    }
+
+    #[test]
+    fn aborted_history_uses_exact_computed_delivered_prefix() {
+        let tracker = CacheHistoryTracker {
+            epoch: 0,
+            prompt: vec![1, 2, 3],
+            branches: HashMap::from([(0, vec![4, 5, 6])]),
+            lora_name: None,
+            cache_namespace: None,
+            prompt_recorded: true,
+            finalized: false,
+        };
+
+        assert_eq!(tracker.aborted_sequence(2, true), Ok(vec![1, 2, 3, 4, 5]));
+        assert_eq!(
+            tracker.aborted_known_sequence(3, 1, true),
+            Ok(vec![1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            tracker.aborted_known_sequence(1, 2, true),
+            Err("unobserved_output_exceeds_computed_output")
+        );
+    }
+
+    #[test]
+    fn aborted_history_rejects_unknown_or_ambiguous_identity() {
+        let too_short = CacheHistoryTracker {
+            epoch: 0,
+            prompt: vec![1],
+            branches: HashMap::from([(0, vec![2])]),
+            lora_name: None,
+            cache_namespace: None,
+            prompt_recorded: true,
+            finalized: false,
+        };
+        assert_eq!(
+            too_short.aborted_sequence(2, true),
+            Err("computed_output_exceeds_delivered_output")
+        );
+
+        let multiple = CacheHistoryTracker {
+            epoch: 0,
+            prompt: vec![1],
+            branches: HashMap::from([(0, vec![2]), (1, vec![3])]),
+            lora_name: None,
+            cache_namespace: None,
+            prompt_recorded: true,
+            finalized: false,
+        };
+        assert_eq!(
+            multiple.aborted_sequence(1, true),
+            Err("multiple_output_branches")
+        );
+    }
+
+    #[test]
+    fn aborted_history_never_synthesizes_an_incomplete_prompt() {
+        let tracker = CacheHistoryTracker {
+            epoch: 0,
+            prompt: vec![1, 2, 3],
+            branches: HashMap::new(),
+            lora_name: None,
+            cache_namespace: None,
+            prompt_recorded: false,
+            finalized: false,
+        };
+
+        assert_eq!(tracker.aborted_sequence(0, false), Err("prompt_incomplete"));
     }
 }
