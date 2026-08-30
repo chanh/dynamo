@@ -442,6 +442,7 @@ mod tests {
             cache_evidence_barrier_enabled: HashMap::new(),
             serving_incarnations: HashMap::new(),
             cache_evidence_serving_incarnations: HashMap::new(),
+            cache_evidence_cache_group_catalogs: HashMap::new(),
             cache_evidence_epoch_enabled: HashMap::new(),
             cache_evidence_epoch_media: HashMap::new(),
             serving_endpoint: endpoint.clone(),

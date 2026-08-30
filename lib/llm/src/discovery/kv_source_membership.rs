@@ -8,7 +8,10 @@ use dynamo_runtime::{component::Instance, protocols::EndpointId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::local_model::runtime_config::ModelRuntimeConfig;
+use crate::{
+    local_model::runtime_config::ModelRuntimeConfig,
+    protocols::common::timing::CacheGroupObservation,
+};
 
 pub type PublisherId = u64;
 
@@ -161,6 +164,8 @@ pub struct KvSourceMembershipView<S = KvEventSource> {
     /// cannot be selected against its predecessor's evidence stream.
     pub serving_incarnations: HashMap<WorkerId, Option<u64>>,
     pub cache_evidence_serving_incarnations: HashMap<WorkerWithDpRank, Option<u64>>,
+    pub cache_evidence_cache_group_catalogs:
+        HashMap<WorkerWithDpRank, Option<Vec<CacheGroupObservation>>>,
     pub cache_evidence_epoch_enabled: HashMap<WorkerId, Option<bool>>,
     pub cache_evidence_epoch_media: HashMap<WorkerWithDpRank, Option<HashSet<String>>>,
 }
@@ -456,6 +461,14 @@ where
                 )
             })
             .collect();
+        let cache_evidence_cache_group_catalogs = expected_workers(runtime_configs)
+            .map(|(worker, _)| {
+                let catalog = runtime_configs
+                    .get(&worker.worker_id)
+                    .and_then(|config| config.cache_evidence_cache_group_catalog(worker.dp_rank));
+                (worker, catalog)
+            })
+            .collect();
         let cache_evidence_epoch_enabled = runtime_configs
             .iter()
             .map(|(&worker_id, config)| {
@@ -486,6 +499,7 @@ where
             cache_evidence_barrier_enabled,
             serving_incarnations,
             cache_evidence_serving_incarnations,
+            cache_evidence_cache_group_catalogs,
             cache_evidence_epoch_enabled,
             cache_evidence_epoch_media,
             sources,
@@ -766,10 +780,44 @@ mod tests {
             ModelRuntimeConfig {
                 data_parallel_start_rank: 4,
                 data_parallel_size: 2,
-                runtime_data: HashMap::from([(
-                    "cache_evidence_serving_incarnations".to_string(),
-                    serde_json::json!({"4": "18446744073709551615", "5": 202}),
-                )]),
+                runtime_data: HashMap::from([
+                    (
+                        "cache_evidence_serving_incarnations".to_string(),
+                        serde_json::json!({"4": "18446744073709551615", "5": 202}),
+                    ),
+                    (
+                        "cache_evidence_cache_group_catalogs".to_string(),
+                        serde_json::json!({
+                            "4": {
+                                "serving_incarnation": "18446744073709551615",
+                                "cache_groups": [{
+                                    "group_idx": 0,
+                                    "kind": "full_attention",
+                                    "block_size": 256,
+                                    "is_eagle": false,
+                                    "alignment_tokens": 256
+                                }, {
+                                    "group_idx": 1,
+                                    "kind": "sliding_window",
+                                    "block_size": 8,
+                                    "sliding_window": 128,
+                                    "is_eagle": false,
+                                    "alignment_tokens": 256
+                                }]
+                            },
+                            "5": {
+                                "serving_incarnation": "201",
+                                "cache_groups": [{
+                                    "group_idx": 0,
+                                    "kind": "full_attention",
+                                    "block_size": 256,
+                                    "is_eagle": false,
+                                    "alignment_tokens": 256
+                                }]
+                            }
+                        }),
+                    ),
+                ]),
                 ..Default::default()
             },
         )]);
@@ -782,6 +830,19 @@ mod tests {
                 (WorkerWithDpRank::new(7, 4), Some(u64::MAX)),
                 (WorkerWithDpRank::new(7, 5), Some(202)),
             ])
+        );
+        let rank_four = view
+            .cache_evidence_cache_group_catalogs
+            .get(&WorkerWithDpRank::new(7, 4))
+            .and_then(Option::as_ref)
+            .unwrap();
+        assert_eq!(rank_four.len(), 2);
+        assert_eq!(rank_four[0].block_size, 256);
+        assert_eq!(rank_four[1].block_size, 8);
+        assert_eq!(
+            view.cache_evidence_cache_group_catalogs
+                .get(&WorkerWithDpRank::new(7, 5)),
+            Some(&None)
         );
     }
 

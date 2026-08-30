@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::discovery::KvSourceMembershipWatch;
+use crate::discovery::{KvSourceMembershipView, KvSourceMembershipWatch};
 use crate::kv_router::metrics::CacheEvidenceMetrics;
 use crate::protocols::common::timing::CacheGroupObservation;
 
@@ -1028,59 +1028,15 @@ impl CacheEvidenceSubscription {
         owner: CacheOwner,
         groups: &[CacheGroupObservation],
     ) -> bool {
-        let mut barriers = self.barriers.lock();
-        let valid = !groups.is_empty()
-            && groups.iter().all(|group| {
-                group.block_size > 0
-                    && group
-                        .alignment_tokens
-                        .is_none_or(|alignment| alignment > 0 && alignment % group.block_size == 0)
-            })
-            && groups
-                .iter()
-                .map(|group| group.group_idx)
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                == groups.len();
-        if !valid {
-            barriers.fail_all("barrier_catalog_changed");
-            self.cold_epoch.lock().fail("cold_epoch_catalog_changed");
-            self.ledger.lock().mark_physical_telemetry_incomplete();
-            return false;
-        }
-        let mut normalized = groups.to_vec();
-        normalized.sort_unstable_by_key(|group| group.group_idx);
-        let (catalog_consistent, catalog_changed) = {
-            let mut catalogs = self.group_shapes.lock();
-            let consistent = catalogs.values().all(|existing| existing == &normalized);
-            let changed = catalogs.get(&owner) != Some(&normalized);
-            if consistent {
-                catalogs.insert(owner, normalized.clone());
-            }
-            (consistent, changed)
-        };
-        if !catalog_consistent {
-            barriers.fail_all("barrier_catalog_changed");
-            self.cold_epoch.lock().fail("cold_epoch_catalog_changed");
-            self.ledger.lock().mark_physical_telemetry_incomplete();
-            self.metrics.update_state(self.ledger.lock().stats());
-            return false;
-        }
-        if catalog_changed {
-            barriers.fail_all("barrier_catalog_changed");
-            self.cold_epoch.lock().fail("cold_epoch_catalog_changed");
-            self.metrics.observe_barrier_incomplete("catalog_changed");
-        }
-        let mut ledger = self.ledger.lock();
-        for tier in [CacheTier::Gpu, CacheTier::Cpu] {
-            ledger.record_group_catalog(
-                owner,
-                tier,
-                normalized.iter().map(|group| group.group_idx),
-            );
-        }
-        self.metrics.update_state(ledger.stats());
-        true
+        record_group_catalog(
+            owner,
+            groups,
+            &self.group_shapes,
+            &self.ledger,
+            &self.barriers,
+            &self.cold_epoch,
+            Some(&self.metrics),
+        )
     }
 
     pub fn group_catalog(&self, owner: CacheOwner) -> Option<Vec<CacheGroupObservation>> {
@@ -1303,6 +1259,144 @@ impl CacheEvidenceSubscription {
             tracing::warn!(%error, "Cold cache-history epoch task failed during shutdown");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_group_catalog(
+    owner: CacheOwner,
+    groups: &[CacheGroupObservation],
+    group_shapes: &Mutex<HashMap<CacheOwner, Vec<CacheGroupObservation>>>,
+    ledger: &Mutex<CacheEvidenceLedger>,
+    barriers: &Mutex<BarrierCoordinator>,
+    cold_epoch: &Mutex<ColdEpochCoordinator>,
+    metrics: Option<&CacheEvidenceMetrics>,
+) -> bool {
+    let mut barriers = barriers.lock();
+    let valid = !groups.is_empty()
+        && groups.iter().all(|group| {
+            matches!(
+                group.kind.as_str(),
+                "full_attention"
+                    | "mla_attention"
+                    | "sink_full_attention"
+                    | "sliding_window"
+                    | "sliding_window_mla"
+            ) && group.block_size > 0
+                && group
+                    .alignment_tokens
+                    .is_some_and(|alignment| alignment > 0 && alignment % group.block_size == 0)
+        })
+        && groups
+            .iter()
+            .map(|group| group.group_idx)
+            .collect::<HashSet<_>>()
+            .len()
+            == groups.len();
+    if !valid {
+        barriers.fail_all("barrier_catalog_changed");
+        cold_epoch.lock().fail("cold_epoch_catalog_changed");
+        let mut state = ledger.lock();
+        state.mark_physical_telemetry_incomplete();
+        state.mark_history_incomplete();
+        if let Some(metrics) = metrics {
+            metrics.update_state(state.stats());
+        }
+        return false;
+    }
+    let mut normalized = groups.to_vec();
+    normalized.sort_unstable_by_key(|group| group.group_idx);
+    let (catalog_consistent, catalog_changed) = {
+        let mut catalogs = group_shapes.lock();
+        let consistent = catalogs.values().all(|existing| existing == &normalized);
+        let changed = catalogs.get(&owner) != Some(&normalized);
+        if consistent {
+            catalogs.insert(owner, normalized.clone());
+        }
+        (consistent, changed)
+    };
+    if !catalog_consistent {
+        barriers.fail_all("barrier_catalog_changed");
+        cold_epoch.lock().fail("cold_epoch_catalog_changed");
+        let mut state = ledger.lock();
+        state.mark_physical_telemetry_incomplete();
+        state.mark_history_incomplete();
+        if let Some(metrics) = metrics {
+            metrics.update_state(state.stats());
+        }
+        return false;
+    }
+    if catalog_changed {
+        barriers.fail_all("barrier_catalog_changed");
+        cold_epoch.lock().fail("cold_epoch_catalog_changed");
+        if let Some(metrics) = metrics {
+            metrics.observe_barrier_incomplete("catalog_changed");
+        }
+    }
+    let mut state = ledger.lock();
+    for tier in [CacheTier::Gpu, CacheTier::Cpu] {
+        state.record_group_catalog(owner, tier, normalized.iter().map(|group| group.group_idx));
+    }
+    if let Some(metrics) = metrics {
+        metrics.update_state(state.stats());
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_attested_group_catalogs(
+    view: &KvSourceMembershipView,
+    group_shapes: &Mutex<HashMap<CacheOwner, Vec<CacheGroupObservation>>>,
+    ledger: &Mutex<CacheEvidenceLedger>,
+    barriers: &Mutex<BarrierCoordinator>,
+    cold_epoch: &Mutex<ColdEpochCoordinator>,
+    metrics: Option<&CacheEvidenceMetrics>,
+) {
+    let active: HashSet<_> = view
+        .sources
+        .iter()
+        .filter_map(|(worker, status)| {
+            status.active_source().map(|_| {
+                (
+                    *worker,
+                    CacheOwner {
+                        worker_id: worker.worker_id,
+                        dp_rank: worker.dp_rank,
+                    },
+                )
+            })
+        })
+        .collect();
+    let active_owners: HashSet<_> = active.iter().map(|(_, owner)| *owner).collect();
+    for (worker, owner) in active {
+        let accepted = view
+            .cache_evidence_cache_group_catalogs
+            .get(&worker)
+            .and_then(Option::as_deref)
+            .is_some_and(|groups| {
+                record_group_catalog(
+                    owner,
+                    groups,
+                    group_shapes,
+                    ledger,
+                    barriers,
+                    cold_epoch,
+                    metrics,
+                )
+            });
+        if !accepted && group_shapes.lock().remove(&owner).is_some() {
+            barriers.lock().fail_all("barrier_catalog_changed");
+            cold_epoch.lock().fail("cold_epoch_catalog_changed");
+            let mut state = ledger.lock();
+            state.mark_physical_telemetry_incomplete();
+            state.mark_history_incomplete();
+            if let Some(metrics) = metrics {
+                metrics.update_state(state.stats());
+            }
+        }
+    }
+    group_shapes
+        .lock()
+        .retain(|owner, _| active_owners.contains(owner));
 }
 
 fn cache_group_hashes(
@@ -2086,6 +2180,14 @@ async fn run_cache_evidence_subscriber(
             })
             .collect();
         let mut history_membership = cold_epoch_owners(&initial_view);
+        sync_attested_group_catalogs(
+            &initial_view,
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            Some(&metrics),
+        );
         let _ = freshness.lock().set_expected(
             initial_view
                 .sources
@@ -2183,6 +2285,14 @@ async fn run_cache_evidence_subscriber(
                         source_sequences.retire(owner);
                         group_shapes.lock().remove(&owner);
                     }
+                    sync_attested_group_catalogs(
+                        &current,
+                        &group_shapes,
+                        &ledger,
+                        &barriers,
+                        &cold_epoch,
+                        Some(&metrics),
+                    );
                     let mut state = ledger.lock();
                     reconcile_history_membership(
                         &mut history_membership,
@@ -2517,10 +2627,179 @@ fn cache_tier(medium: Option<&str>) -> Option<CacheTier> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{KvEventSource, KvSourceStatus, KvStateEndpointResolution};
     use dynamo_kv_router::{
         cache_loss::{CacheEvidenceStoredBlock, KnownBool},
         zmq_wire::{BlockHashValue, KvCacheSpecKind, Locality},
     };
+
+    fn catalog_group(group_idx: u32, kind: &str, block_size: u32) -> CacheGroupObservation {
+        CacheGroupObservation {
+            group_idx,
+            kind: kind.to_string(),
+            block_size,
+            sliding_window: (kind == "sliding_window").then_some(128),
+            is_eagle: false,
+            alignment_tokens: Some(256),
+        }
+    }
+
+    fn catalog_membership_view(
+        catalog: Option<Vec<CacheGroupObservation>>,
+    ) -> KvSourceMembershipView {
+        let worker = WorkerWithDpRank::new(7, 4);
+        let endpoint = dynamo_runtime::protocols::EndpointId {
+            namespace: "ns".to_string(),
+            component: "worker".to_string(),
+            name: "generate".to_string(),
+        };
+        KvSourceMembershipView {
+            serving_endpoint: endpoint.clone(),
+            endpoint_resolution: KvStateEndpointResolution::Resolved(endpoint.clone()),
+            sources: HashMap::from([(
+                worker,
+                KvSourceStatus::ActiveLiveOnly(KvEventSource {
+                    kv_state_endpoint: endpoint,
+                    worker,
+                    publisher_id: 11,
+                    evidence_incarnation_id: Some(12),
+                    recovery_target: None,
+                }),
+            )]),
+            kv_event_publishing_enabled: HashMap::from([(7, Some(true))]),
+            kv_event_source_mode: HashMap::new(),
+            recovery_expected: HashMap::from([(worker, false)]),
+            cache_evidence_barrier_enabled: HashMap::from([(7, Some(true))]),
+            serving_incarnations: HashMap::from([(7, Some(1))]),
+            cache_evidence_serving_incarnations: HashMap::from([(worker, Some(99))]),
+            cache_evidence_cache_group_catalogs: HashMap::from([(worker, catalog)]),
+            cache_evidence_epoch_enabled: HashMap::from([(7, Some(true))]),
+            cache_evidence_epoch_media: HashMap::from([(
+                worker,
+                Some(HashSet::from(["GPU".to_string(), "CPU".to_string()])),
+            )]),
+        }
+    }
+
+    #[test]
+    fn attested_multigroup_catalog_seeds_g0_and_change_fails_closed() {
+        let owner = CacheOwner {
+            worker_id: 7,
+            dp_rank: 4,
+        };
+        let group_shapes = Mutex::new(HashMap::new());
+        let ledger = Mutex::new(CacheEvidenceLedger::new(16));
+        ledger.lock().set_expected_owners([owner]);
+        let barriers = Mutex::new(BarrierCoordinator::new(8));
+        let cold_epoch = Mutex::new(ColdEpochCoordinator::default());
+        let catalog = vec![
+            catalog_group(1, "sliding_window", 8),
+            catalog_group(0, "full_attention", 256),
+        ];
+
+        assert!(record_group_catalog(
+            owner,
+            &catalog,
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            None,
+        ));
+        assert_eq!(group_shapes.lock()[&owner][0].group_idx, 0);
+        assert_eq!(ledger.lock().stats().expected_owners, 1);
+        assert_eq!(ledger.lock().stats().cataloged_owners, 1);
+        assert!(record_group_catalog(
+            owner,
+            &catalog,
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            None,
+        ));
+
+        let changed = vec![catalog_group(0, "full_attention", 128)];
+        assert!(!record_group_catalog(
+            owner,
+            &changed,
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            None,
+        ));
+        let stats = ledger.lock().stats();
+        assert!(!stats.physical_telemetry_complete);
+        assert!(!stats.history_complete);
+    }
+
+    #[test]
+    fn missing_or_changed_attestation_removes_prior_catalog() {
+        let owner = CacheOwner {
+            worker_id: 7,
+            dp_rank: 4,
+        };
+        let group_shapes = Mutex::new(HashMap::new());
+        let ledger = Mutex::new(CacheEvidenceLedger::new(16));
+        ledger.lock().set_expected_owners([owner]);
+        let barriers = Mutex::new(BarrierCoordinator::new(8));
+        let cold_epoch = Mutex::new(ColdEpochCoordinator::default());
+        let catalog = vec![catalog_group(0, "full_attention", 256)];
+
+        sync_attested_group_catalogs(
+            &catalog_membership_view(Some(catalog)),
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            None,
+        );
+        assert!(group_shapes.lock().contains_key(&owner));
+
+        sync_attested_group_catalogs(
+            &catalog_membership_view(Some(vec![catalog_group(0, "full_attention", 128)])),
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            None,
+        );
+        assert!(!group_shapes.lock().contains_key(&owner));
+        assert!(!ledger.lock().stats().physical_telemetry_complete);
+
+        sync_attested_group_catalogs(
+            &catalog_membership_view(None),
+            &group_shapes,
+            &ledger,
+            &barriers,
+            &cold_epoch,
+            None,
+        );
+        assert!(!group_shapes.lock().contains_key(&owner));
+    }
+
+    #[test]
+    fn unsupported_attested_group_kind_never_counts_as_cataloged() {
+        let owner = CacheOwner {
+            worker_id: 7,
+            dp_rank: 4,
+        };
+        let group_shapes = Mutex::new(HashMap::new());
+        let ledger = Mutex::new(CacheEvidenceLedger::new(16));
+        ledger.lock().set_expected_owners([owner]);
+
+        assert!(!record_group_catalog(
+            owner,
+            &[catalog_group(0, "unknown_attention", 256)],
+            &group_shapes,
+            &ledger,
+            &Mutex::new(BarrierCoordinator::new(8)),
+            &Mutex::new(ColdEpochCoordinator::default()),
+            None,
+        ));
+        assert_eq!(ledger.lock().stats().cataloged_owners, 0);
+    }
 
     fn store(group: u32, medium: &str) -> RawKvEvent {
         RawKvEvent::BlockStored {

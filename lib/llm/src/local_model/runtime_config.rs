@@ -19,6 +19,8 @@ use dynamo_kv_router::{
 };
 use dynamo_runtime::{config::is_truthy, protocols::EndpointId};
 
+use crate::protocols::common::timing::CacheGroupObservation;
+
 /// Re-export from parsers crate so that `ModelRuntimeConfig` can use it
 /// directly without type duplication.
 pub use dynamo_parsers::tool_calling::StructuralTagSchemaMode;
@@ -403,6 +405,36 @@ impl ModelRuntimeConfig {
             .filter(|value| *value > 0)
     }
 
+    pub(crate) fn cache_evidence_cache_group_catalog(
+        &self,
+        dp_rank: u32,
+    ) -> Option<Vec<CacheGroupObservation>> {
+        let attestation = self
+            .runtime_data
+            .get("cache_evidence_cache_group_catalogs")?
+            .as_object()?
+            .get(&dp_rank.to_string())?
+            .as_object()?;
+        let attested_incarnation = attestation
+            .get("serving_incarnation")
+            .and_then(|value| match value {
+                serde_json::Value::String(value)
+                    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    value.parse().ok()
+                }
+                serde_json::Value::Number(value) => value
+                    .as_u64()
+                    .filter(|value| *value <= Self::MAX_SAFE_JSON_INTEGER),
+                _ => None,
+            })
+            .filter(|value| *value > 0)?;
+        if self.cache_evidence_serving_incarnation(dp_rank) != Some(attested_incarnation) {
+            return None;
+        }
+        serde_json::from_value(attestation.get("cache_groups")?.clone()).ok()
+    }
+
     pub(crate) fn cache_evidence_epoch_media(&self, dp_rank: u32) -> Option<HashSet<String>> {
         let media: HashSet<_> = self
             .runtime_data
@@ -747,6 +779,74 @@ impl ModelRuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_group() -> serde_json::Value {
+        serde_json::json!({
+            "group_idx": 1,
+            "kind": "sliding_window",
+            "block_size": 8,
+            "sliding_window": 128,
+            "is_eagle": false,
+            "alignment_tokens": 256
+        })
+    }
+
+    #[test]
+    fn cache_group_catalog_requires_matching_serving_incarnation() {
+        let config = ModelRuntimeConfig {
+            runtime_data: HashMap::from([
+                (
+                    "cache_evidence_serving_incarnations".to_string(),
+                    serde_json::json!({"4": "18446744073709551615", "5": "202"}),
+                ),
+                (
+                    "cache_evidence_cache_group_catalogs".to_string(),
+                    serde_json::json!({
+                        "4": {
+                            "serving_incarnation": "18446744073709551615",
+                            "cache_groups": [cache_group()]
+                        },
+                        "5": {
+                            "serving_incarnation": "201",
+                            "cache_groups": [cache_group()]
+                        }
+                    }),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.cache_evidence_cache_group_catalog(4).unwrap()[0].block_size,
+            8
+        );
+        assert_eq!(config.cache_evidence_cache_group_catalog(5), None);
+        assert_eq!(config.cache_evidence_cache_group_catalog(6), None);
+    }
+
+    #[test]
+    fn cache_group_catalog_rejects_unsafe_numeric_incarnation() {
+        let config = ModelRuntimeConfig {
+            runtime_data: HashMap::from([
+                (
+                    "cache_evidence_serving_incarnations".to_string(),
+                    serde_json::json!({"0": "9007199254740992"}),
+                ),
+                (
+                    "cache_evidence_cache_group_catalogs".to_string(),
+                    serde_json::json!({
+                        "0": {
+                            "serving_incarnation": 9_007_199_254_740_992_u64,
+                            "cache_groups": [cache_group()]
+                        }
+                    }),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(config.cache_evidence_cache_group_catalog(0), None);
+    }
 
     // Env-touching tests use `temp_env` (snapshot + restore around the closure) and
     // `#[serial_test::serial]` (serialize against every other env-touching test in the
