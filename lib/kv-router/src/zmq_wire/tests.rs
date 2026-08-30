@@ -1125,6 +1125,58 @@ fn cpu_event_with_placeholder_payload_is_dropped_safely() {
 }
 
 #[test]
+fn store_with_shorter_than_canonical_tokens_is_dropped_safely() {
+    let raw = cpu_block_stored(CpuBlockStoredFixture {
+        block_hashes: &[201],
+        token_ids: &[10, 11, 12],
+        block_size: 4,
+        parent_block_hash: None,
+    });
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(
+        raw,
+        42,
+        4,
+        WorkerWithDpRank::new(7, 0),
+        &warning_count,
+        None,
+    )
+    .expect("short Store remains an explicit empty Store");
+
+    let KvCacheEventData::Stored(store) = placement.event.data else {
+        panic!("expected Stored event");
+    };
+    assert!(store.blocks.is_empty());
+    assert!(warning_count.load(Ordering::Relaxed) >= 1);
+}
+
+#[test]
+fn zero_canonical_block_size_cannot_panic_on_placeholder_store() {
+    let raw = cpu_block_stored(CpuBlockStoredFixture {
+        block_hashes: &[201],
+        token_ids: &[],
+        block_size: 0,
+        parent_block_hash: None,
+    });
+    let warning_count = Arc::new(AtomicU32::new(0));
+    let placement = convert_event(
+        raw,
+        42,
+        0,
+        WorkerWithDpRank::new(7, 0),
+        &warning_count,
+        None,
+    )
+    .expect("placeholder Store remains an explicit empty Store");
+
+    let KvCacheEventData::Stored(store) = placement.event.data else {
+        panic!("expected Stored event");
+    };
+    assert!(store.blocks.is_empty());
+    assert!(warning_count.load(Ordering::Relaxed) >= 1);
+}
+
+#[test]
 fn cpu_event_with_full_payload_is_indexable() {
     let raw = cpu_block_stored(CpuBlockStoredFixture {
         block_hashes: &[201, 202],

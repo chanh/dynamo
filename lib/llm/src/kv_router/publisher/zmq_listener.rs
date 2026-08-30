@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -28,6 +28,141 @@ pub(super) struct DecodedZmqKvBatch {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SourceSequenceTracker {
     last: Option<u64>,
+}
+
+// Match the supported OffloadingConnector's production tracker bound. A lower
+// consumer bound would make otherwise supported CPU-cache churn permanently
+// incomplete before the producer reaches its own safety limit.
+const MAX_EVIDENCE_HASH_MAPPINGS: usize = 4_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceHashMapping {
+    Known(CacheEvidenceStoredBlock),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceMutationError {
+    Invalid,
+    UnresolvedHash,
+    AmbiguousHash,
+    MappingOverflow,
+}
+
+impl EvidenceMutationError {
+    fn metric_reason(self) -> &'static str {
+        match self {
+            Self::Invalid => "evidence_conversion_error",
+            Self::UnresolvedHash => "evidence_hash_unresolved",
+            Self::AmbiguousHash => "evidence_hash_ambiguous",
+            Self::MappingOverflow => "evidence_hash_mapping_overflow",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EvidenceHashResolver {
+    // The listener lifetime binds the source incarnation. DP ranks may share
+    // one source, so the owner remains part of the identity fence.
+    mappings: HashMap<(CacheOwner, u64), EvidenceHashMapping>,
+    capacity: usize,
+}
+
+impl EvidenceHashResolver {
+    fn new(capacity: usize) -> Self {
+        Self {
+            mappings: HashMap::new(),
+            capacity,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.mappings.clear();
+    }
+
+    fn clear_owner(&mut self, owner: CacheOwner) {
+        self.mappings
+            .retain(|(mapped_owner, _), _| *mapped_owner != owner);
+    }
+
+    fn learn_gpu(
+        &mut self,
+        owner: CacheOwner,
+        blocks: &[CacheEvidenceStoredBlock],
+    ) -> Result<(), EvidenceMutationError> {
+        let mut pending = HashMap::with_capacity(blocks.len());
+        let mut ambiguous = HashSet::new();
+        for &block in blocks {
+            let key = (owner, block.external_hash);
+            if let Some(previous) = pending.insert(key, block)
+                && previous != block
+            {
+                ambiguous.insert(key);
+            }
+            match self.mappings.get(&key) {
+                Some(EvidenceHashMapping::Known(existing)) if *existing != block => {
+                    ambiguous.insert(key);
+                }
+                Some(EvidenceHashMapping::Ambiguous) => {
+                    ambiguous.insert(key);
+                }
+                _ => {}
+            }
+        }
+
+        if !ambiguous.is_empty() {
+            for &key in &ambiguous {
+                if self.mappings.contains_key(&key) {
+                    self.mappings.insert(key, EvidenceHashMapping::Ambiguous);
+                }
+            }
+            let new_ambiguous = ambiguous
+                .iter()
+                .filter(|key| !self.mappings.contains_key(key))
+                .count();
+            if self.mappings.len().saturating_add(new_ambiguous) > self.capacity {
+                return Err(EvidenceMutationError::MappingOverflow);
+            }
+            for key in ambiguous {
+                self.mappings.insert(key, EvidenceHashMapping::Ambiguous);
+            }
+            return Err(EvidenceMutationError::AmbiguousHash);
+        }
+
+        let new_entries = pending
+            .keys()
+            .filter(|key| !self.mappings.contains_key(key))
+            .count();
+        if self.mappings.len().saturating_add(new_entries) > self.capacity {
+            return Err(EvidenceMutationError::MappingOverflow);
+        }
+
+        for (key, block) in pending {
+            self.mappings
+                .entry(key)
+                .or_insert(EvidenceHashMapping::Known(block));
+        }
+        Ok(())
+    }
+
+    fn resolve_cpu(
+        &self,
+        owner: CacheOwner,
+        external_hashes: &[u64],
+    ) -> Result<Vec<CacheEvidenceStoredBlock>, EvidenceMutationError> {
+        external_hashes
+            .iter()
+            .map(
+                |&external_hash| match self.mappings.get(&(owner, external_hash)) {
+                    Some(EvidenceHashMapping::Known(block)) => Ok(*block),
+                    Some(EvidenceHashMapping::Ambiguous) => {
+                        Err(EvidenceMutationError::AmbiguousHash)
+                    }
+                    None => Err(EvidenceMutationError::UnresolvedHash),
+                },
+            )
+            .collect()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -133,6 +268,7 @@ pub(super) async fn start_zmq_listener(
 
     let mut normalizer = ZmqEventNormalizer::new(kv_block_size).with_image_token_id(image_token_id);
     let evidence_warning_count = Arc::new(AtomicU32::new(0));
+    let mut evidence_hash_resolver = EvidenceHashResolver::new(MAX_EVIDENCE_HASH_MAPPINGS);
     let socket = match connect_sub_socket(&zmq_endpoint, Some(&zmq_topic)).await {
         Ok(socket) => socket,
         Err(error) => {
@@ -142,7 +278,6 @@ pub(super) async fn start_zmq_listener(
     };
     let mut socket = socket;
     let metrics = kv_publisher_metrics();
-
     if cancellation_token.is_cancelled() {
         return;
     }
@@ -184,6 +319,7 @@ pub(super) async fn start_zmq_listener(
                     Ok(decoded) => decoded,
                     Err(error) => {
                         tracing::warn!(%error, "Failed to decode ZMQ KV batch");
+                        evidence_hash_resolver.clear();
                         if let Some(metrics) = &metrics {
                             metrics.mark_telemetry_incomplete("source_decode_error");
                         }
@@ -195,6 +331,7 @@ pub(super) async fn start_zmq_listener(
                     SourceSequenceObservation::Contiguous => {}
                     SourceSequenceObservation::Gap { missing } => {
                         tracing::warn!(engine_seq, missing, "ZMQ KV source sequence gap");
+                        evidence_hash_resolver.clear();
                         if let Some(metrics) = &metrics {
                             metrics.record_source_gap(missing);
                         }
@@ -236,21 +373,28 @@ pub(super) async fn start_zmq_listener(
                 {
                     telemetry_complete = false;
                 }
-                let mutations = batch
-                    .events
-                    .iter()
-                    .filter_map(|event| match cache_evidence_mutation(
+                let mutations = batch.events.iter().filter_map(|event| {
+                    match cache_evidence_mutation_with_resolver(
                         event,
+                        owner,
                         image_token_id,
                         &evidence_warning_count,
+                        &mut evidence_hash_resolver,
                     ) {
                         Ok(mutation) => mutation,
-                        Err(()) => {
+                        Err(error) => {
                             telemetry_complete = false;
+                            if let Some(metrics) = &metrics {
+                                metrics.increment_zmq_conversion_issue(
+                                    event.event_type_label(),
+                                    error.metric_reason(),
+                                );
+                                metrics.mark_telemetry_incomplete(error.metric_reason());
+                            }
                             None
                         }
-                    })
-                    .collect();
+                    }
+                }).collect();
                 if let Some(evidence_tx) = &evidence_tx {
                     if let Some(metrics) = &metrics {
                         metrics.increment_evidence_queue_depth();
@@ -365,16 +509,36 @@ pub(super) async fn start_zmq_listener(
     );
 }
 
+#[cfg(test)]
 fn cache_evidence_mutation(
     event: &RawKvEvent,
     image_token_id: Option<u32>,
     warning_count: &Arc<AtomicU32>,
-) -> Result<Option<CacheEvidenceMutation>, ()> {
+) -> Result<Option<CacheEvidenceMutation>, EvidenceMutationError> {
+    cache_evidence_mutation_with_resolver(
+        event,
+        CacheOwner {
+            worker_id: 0,
+            dp_rank: 0,
+        },
+        image_token_id,
+        warning_count,
+        &mut EvidenceHashResolver::new(MAX_EVIDENCE_HASH_MAPPINGS),
+    )
+}
+
+fn cache_evidence_mutation_with_resolver(
+    event: &RawKvEvent,
+    owner: CacheOwner,
+    image_token_id: Option<u32>,
+    warning_count: &Arc<AtomicU32>,
+    resolver: &mut EvidenceHashResolver,
+) -> Result<Option<CacheEvidenceMutation>, EvidenceMutationError> {
     if !matches!(event.ownership(), Ok(KvEventOwnership::Framework)) {
-        return Err(());
+        return Err(EvidenceMutationError::Invalid);
     }
     if matches!(event.locality(), Some(Locality::Remote | Locality::Unknown)) {
-        return Err(());
+        return Err(EvidenceMutationError::Invalid);
     }
 
     let tier = |medium: Option<&str>| match medium {
@@ -382,8 +546,8 @@ fn cache_evidence_mutation(
         Some(medium) => match StorageTier::from_kv_medium(medium) {
             Some(StorageTier::Device) => Ok(CacheTier::Gpu),
             Some(StorageTier::HostPinned) => Ok(CacheTier::Cpu),
-            Some(StorageTier::Disk | StorageTier::External) => Err(()),
-            None => Err(()),
+            Some(StorageTier::Disk | StorageTier::External) => Err(EvidenceMutationError::Invalid),
+            None => Err(EvidenceMutationError::Invalid),
         },
     };
 
@@ -406,33 +570,46 @@ fn cache_evidence_mutation(
                 .copied()
                 .map(BlockHashValue::into_u64)
                 .collect();
-            let num_block_tokens = vec![*block_size as u64; external_hashes.len()];
-            let stored = create_stored_blocks(
-                (*block_size).try_into().map_err(|_| ())?,
-                token_ids,
-                &num_block_tokens,
-                &external_hashes,
-                lora_name.as_deref(),
-                cache_namespace.as_deref(),
-                warning_count,
-                block_mm_infos.as_deref(),
-                *is_eagle,
-                image_token_id,
-            );
-            if stored.len() != external_hashes.len() {
-                return Err(());
-            }
-            Ok(Some(CacheEvidenceMutation::Store {
-                tier: tier(medium.as_deref())?,
-                group_idx: *group_idx,
-                parent_external_hash: parent_block_hash.map(BlockHashValue::into_u64),
-                blocks: stored
+            let store_tier = tier(medium.as_deref())?;
+            let stored = if store_tier == CacheTier::Cpu && token_ids.is_empty() && *block_size == 0
+            {
+                resolver.resolve_cpu(owner, &external_hashes)?
+            } else {
+                let num_block_tokens = vec![*block_size as u64; external_hashes.len()];
+                let stored = create_stored_blocks(
+                    (*block_size)
+                        .try_into()
+                        .map_err(|_| EvidenceMutationError::Invalid)?,
+                    token_ids,
+                    &num_block_tokens,
+                    &external_hashes,
+                    lora_name.as_deref(),
+                    cache_namespace.as_deref(),
+                    warning_count,
+                    block_mm_infos.as_deref(),
+                    *is_eagle,
+                    image_token_id,
+                );
+                if stored.len() != external_hashes.len() {
+                    return Err(EvidenceMutationError::Invalid);
+                }
+                let stored: Vec<_> = stored
                     .into_iter()
                     .map(|block| CacheEvidenceStoredBlock {
                         external_hash: block.block_hash.0,
                         tokens_hash: block.tokens_hash.0,
                     })
-                    .collect(),
+                    .collect();
+                if store_tier == CacheTier::Gpu {
+                    resolver.learn_gpu(owner, &stored)?;
+                }
+                stored
+            };
+            Ok(Some(CacheEvidenceMutation::Store {
+                tier: store_tier,
+                group_idx: *group_idx,
+                parent_external_hash: parent_block_hash.map(BlockHashValue::into_u64),
+                blocks: stored,
             }))
         }
         RawKvEvent::BlockRemoved {
@@ -449,7 +626,12 @@ fn cache_evidence_mutation(
                 .map(BlockHashValue::into_u64)
                 .collect(),
         })),
-        RawKvEvent::AllBlocksCleared { medium, .. } => {
+        RawKvEvent::AllBlocksCleared {
+            medium, epoch_id, ..
+        } => {
+            if medium.is_none() || epoch_id.is_some() {
+                resolver.clear_owner(owner);
+            }
             let cleared_tier = match medium.as_deref() {
                 Some(medium) => Some(tier(Some(medium))?),
                 None => None,
@@ -507,6 +689,239 @@ mod tests {
         TokensWithHashes::new(tokens.to_vec(), block_size)
             .get_or_compute_seq_hashes()
             .to_vec()
+    }
+
+    fn resolver_store(
+        medium: &str,
+        group_idx: u32,
+        external_hash: u64,
+        token_ids: Vec<u32>,
+        block_size: usize,
+    ) -> RawKvEvent {
+        RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(external_hash)],
+            parent_block_hash: None,
+            token_ids,
+            block_size,
+            medium: Some(medium.to_string()),
+            lora_name: None,
+            cache_namespace: None,
+            block_mm_infos: None,
+            is_eagle: None,
+            group_idx: Some(group_idx),
+            kv_cache_spec_kind: Some(KvCacheSpecKind::FullAttention),
+            kv_cache_spec_sliding_window: None,
+            locality: Some(Locality::Local),
+            ownership: None,
+        }
+    }
+
+    fn resolver_store_many(
+        medium: &str,
+        group_idx: u32,
+        external_hashes: &[u64],
+        token_ids: Vec<u32>,
+        block_size: usize,
+    ) -> RawKvEvent {
+        let mut event = resolver_store(medium, group_idx, 0, token_ids, block_size);
+        let RawKvEvent::BlockStored { block_hashes, .. } = &mut event else {
+            unreachable!("resolver store helper always returns a store");
+        };
+        *block_hashes = external_hashes
+            .iter()
+            .copied()
+            .map(BlockHashValue::Unsigned)
+            .collect();
+        event
+    }
+
+    fn resolve_with(
+        resolver: &mut EvidenceHashResolver,
+        event: &RawKvEvent,
+    ) -> Result<Option<CacheEvidenceMutation>, EvidenceMutationError> {
+        cache_evidence_mutation_with_resolver(
+            event,
+            TEST_OWNER,
+            None,
+            &Arc::new(AtomicU32::new(0)),
+            resolver,
+        )
+    }
+
+    #[test]
+    fn hash_only_cpu_store_resolves_only_after_same_source_gpu_store() {
+        let gpu = resolver_store("GPU", 0, 41, vec![1; 16], 16);
+        let cpu = resolver_store("CPU", 0, 41, vec![], 0);
+        let mut resolver = EvidenceHashResolver::new(8);
+
+        assert_eq!(
+            resolve_with(&mut resolver, &cpu),
+            Err(EvidenceMutationError::UnresolvedHash)
+        );
+        let gpu_mutation = resolve_with(&mut resolver, &gpu).unwrap().unwrap();
+        let cpu_mutation = resolve_with(&mut resolver, &cpu).unwrap().unwrap();
+        let CacheEvidenceMutation::Store {
+            blocks: gpu_blocks, ..
+        } = gpu_mutation
+        else {
+            panic!("GPU mutation must be a store");
+        };
+        let CacheEvidenceMutation::Store {
+            tier,
+            blocks: cpu_blocks,
+            ..
+        } = cpu_mutation
+        else {
+            panic!("CPU mutation must be a store");
+        };
+        assert_eq!(tier, CacheTier::Cpu);
+        assert_eq!(cpu_blocks, gpu_blocks);
+
+        let other_owner = CacheOwner {
+            worker_id: TEST_OWNER.worker_id,
+            dp_rank: 1,
+        };
+        assert_eq!(
+            cache_evidence_mutation_with_resolver(
+                &cpu,
+                other_owner,
+                None,
+                &Arc::new(AtomicU32::new(0)),
+                &mut resolver,
+            ),
+            Err(EvidenceMutationError::UnresolvedHash)
+        );
+    }
+
+    #[test]
+    fn hash_only_cpu_mapping_survives_gpu_eviction() {
+        let gpu = resolver_store("GPU", 0, 51, vec![2; 16], 16);
+        let cpu = resolver_store("CPU", 0, 51, vec![], 0);
+        let remove = RawKvEvent::BlockRemoved {
+            block_hashes: vec![BlockHashValue::Unsigned(51)],
+            medium: Some("GPU".to_string()),
+            group_idx: Some(0),
+            kv_cache_spec_kind: Some(KvCacheSpecKind::FullAttention),
+            kv_cache_spec_sliding_window: None,
+            locality: Some(Locality::Local),
+            ownership: None,
+        };
+        let mut resolver = EvidenceHashResolver::new(8);
+
+        resolve_with(&mut resolver, &gpu).unwrap();
+        resolve_with(&mut resolver, &remove).unwrap();
+        assert!(resolve_with(&mut resolver, &cpu).unwrap().is_some());
+    }
+
+    #[test]
+    fn hash_mapping_collision_is_ambiguous_until_source_restart() {
+        let first = resolver_store("GPU", 0, 61, vec![3; 16], 16);
+        let conflicting = resolver_store("GPU", 0, 61, vec![4; 16], 16);
+        let cpu = resolver_store("CPU", 0, 61, vec![], 0);
+        let mut resolver = EvidenceHashResolver::new(8);
+
+        resolve_with(&mut resolver, &first).unwrap();
+        assert_eq!(
+            resolve_with(&mut resolver, &conflicting),
+            Err(EvidenceMutationError::AmbiguousHash)
+        );
+        assert_eq!(
+            resolve_with(&mut resolver, &cpu),
+            Err(EvidenceMutationError::AmbiguousHash)
+        );
+
+        let mut restarted_source = EvidenceHashResolver::new(8);
+        assert_eq!(
+            resolve_with(&mut restarted_source, &cpu),
+            Err(EvidenceMutationError::UnresolvedHash)
+        );
+    }
+
+    #[test]
+    fn hash_mapping_capacity_fails_closed_without_eviction() {
+        let first = resolver_store("GPU", 0, 71, vec![5; 16], 16);
+        let second = resolver_store("GPU", 0, 72, vec![6; 16], 16);
+        let cpu_first = resolver_store("CPU", 0, 71, vec![], 0);
+        let mut resolver = EvidenceHashResolver::new(1);
+
+        resolve_with(&mut resolver, &first).unwrap();
+        assert_eq!(
+            resolve_with(&mut resolver, &second),
+            Err(EvidenceMutationError::MappingOverflow)
+        );
+        assert!(resolve_with(&mut resolver, &cpu_first).unwrap().is_some());
+        assert_eq!(resolver.mappings.len(), 1);
+    }
+
+    #[test]
+    fn rejected_multi_block_gpu_store_cannot_partially_seed_on_overflow() {
+        let gpu = resolver_store_many("GPU", 0, &[91, 92], vec![8; 32], 16);
+        let cpu_first = resolver_store("CPU", 0, 91, vec![], 0);
+        let mut resolver = EvidenceHashResolver::new(1);
+
+        assert_eq!(
+            resolve_with(&mut resolver, &gpu),
+            Err(EvidenceMutationError::MappingOverflow)
+        );
+        assert!(resolver.mappings.is_empty());
+        assert_eq!(
+            resolve_with(&mut resolver, &cpu_first),
+            Err(EvidenceMutationError::UnresolvedHash)
+        );
+    }
+
+    #[test]
+    fn rejected_multi_block_gpu_collision_quarantines_only_conflicting_hash() {
+        let seed = resolver_store("GPU", 0, 102, vec![9; 16], 16);
+        let conflicting = resolver_store_many("GPU", 0, &[101, 102], vec![10; 32], 16);
+        let cpu_new = resolver_store("CPU", 0, 101, vec![], 0);
+        let cpu_conflict = resolver_store("CPU", 0, 102, vec![], 0);
+        let mut resolver = EvidenceHashResolver::new(8);
+
+        resolve_with(&mut resolver, &seed).unwrap();
+        assert_eq!(
+            resolve_with(&mut resolver, &conflicting),
+            Err(EvidenceMutationError::AmbiguousHash)
+        );
+        assert_eq!(
+            resolve_with(&mut resolver, &cpu_new),
+            Err(EvidenceMutationError::UnresolvedHash)
+        );
+        assert_eq!(
+            resolve_with(&mut resolver, &cpu_conflict),
+            Err(EvidenceMutationError::AmbiguousHash)
+        );
+    }
+
+    #[test]
+    fn new_ambiguous_tombstone_cannot_exceed_mapping_capacity() {
+        let duplicate = resolver_store_many("GPU", 0, &[111, 111], vec![11; 32], 16);
+        let mut resolver = EvidenceHashResolver::new(0);
+
+        assert_eq!(
+            resolve_with(&mut resolver, &duplicate),
+            Err(EvidenceMutationError::MappingOverflow)
+        );
+        assert!(resolver.mappings.is_empty());
+    }
+
+    #[test]
+    fn cold_epoch_clear_discards_hash_mapping_generation() {
+        let gpu = resolver_store("GPU", 0, 81, vec![7; 16], 16);
+        let cpu = resolver_store("CPU", 0, 81, vec![], 0);
+        let clear = RawKvEvent::AllBlocksCleared {
+            medium: Some("GPU".to_string()),
+            ownership: None,
+            epoch_id: Some("00000000000000000000000000000001".to_string()),
+        };
+        let mut resolver = EvidenceHashResolver::new(8);
+
+        resolve_with(&mut resolver, &gpu).unwrap();
+        resolve_with(&mut resolver, &clear).unwrap();
+        assert_eq!(
+            resolve_with(&mut resolver, &cpu),
+            Err(EvidenceMutationError::UnresolvedHash)
+        );
     }
 
     #[test]
@@ -789,7 +1204,7 @@ mod tests {
         let warning_count = Arc::new(AtomicU32::new(0));
         assert_eq!(
             cache_evidence_mutation(&event, None, &warning_count),
-            Err(())
+            Err(EvidenceMutationError::Invalid)
         );
         if let RawKvEvent::BlockRemoved {
             medium, locality, ..
@@ -800,7 +1215,7 @@ mod tests {
         }
         assert_eq!(
             cache_evidence_mutation(&event, None, &warning_count),
-            Err(())
+            Err(EvidenceMutationError::Invalid)
         );
     }
 }

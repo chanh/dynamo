@@ -229,6 +229,16 @@ pub fn create_stored_block_from_parts(
     token_ids: &[u32],
     options: StoredBlockOptions<'_>,
 ) -> KvCacheStoredBlockData {
+    try_create_stored_block_from_parts(kv_block_size, block_hash, token_ids, options)
+        .expect("stored block requires one complete canonical token block")
+}
+
+fn try_create_stored_block_from_parts(
+    kv_block_size: u32,
+    block_hash: u64,
+    token_ids: &[u32],
+    options: StoredBlockOptions<'_>,
+) -> Option<KvCacheStoredBlockData> {
     let StoredBlockOptions {
         lora_name,
         cache_namespace,
@@ -256,7 +266,9 @@ pub fn create_stored_block_from_parts(
                     cache_namespace,
                     is_eagle,
                 },
-            )[0]
+            )
+            .into_iter()
+            .next()?
         }
         _ => {
             let block_mm_infos = mm_extra_info.as_ref().map(|info| vec![Some(info.clone())]);
@@ -269,7 +281,9 @@ pub fn create_stored_block_from_parts(
                     cache_namespace,
                     is_eagle,
                 },
-            )[0]
+            )
+            .into_iter()
+            .next()?
         }
     };
 
@@ -281,11 +295,11 @@ pub fn create_stored_block_from_parts(
         kv_block_size,
         mm_extra_info
     );
-    KvCacheStoredBlockData {
+    Some(KvCacheStoredBlockData {
         block_hash: ExternalSequenceBlockHash::from(block_hash),
         tokens_hash,
         mm_extra_info,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -337,7 +351,7 @@ pub fn create_stored_blocks(
             .and_then(|infos| infos.get(block_idx))
             .and_then(|opt| opt.clone());
 
-        blocks.push(create_stored_block_from_parts(
+        let Some(block) = try_create_stored_block_from_parts(
             kv_block_size,
             *block_hash_it,
             tokens,
@@ -348,7 +362,17 @@ pub fn create_stored_blocks(
                 is_eagle,
                 image_token_id,
             },
-        ));
+        ) else {
+            if warning_count.fetch_add(1, Ordering::Relaxed) < 3 {
+                tracing::warn!(
+                    kv_block_size,
+                    token_count = tokens.len(),
+                    "Block not published because it has no complete canonical token block"
+                );
+            }
+            break;
+        };
+        blocks.push(block);
         token_offset += *num_tokens_it as usize;
     }
 
