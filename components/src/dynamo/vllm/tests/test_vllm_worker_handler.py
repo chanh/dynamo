@@ -522,6 +522,70 @@ class TestReasoningParserForwarding:
         np.testing.assert_array_equal(decoded, routed_experts.reshape(-1))
 
     @pytest.mark.asyncio
+    async def test_generate_tokens_publishes_completed_prompt_source_once(self):
+        from vllm.sampling_params import SamplingParams
+
+        handler = _make_handler()
+        handler._extract_logprobs = MagicMock(return_value=(None, None))
+        handler._prompt_source_publisher = MagicMock()
+        handler._prompt_source_cache_groups = None
+        handler._prompt_source_active_origins = mod.OrderedDict(
+            [("req-1", (17, 23, mod.time.monotonic()))]
+        )
+        handler._prompt_source_pending_origins = mod.OrderedDict()
+
+        async def fake_generate(*args, **kwargs):
+            yield SimpleNamespace(
+                request_id="req-1",
+                finished=True,
+                outputs=[
+                    SimpleNamespace(
+                        index=0,
+                        token_ids=[11],
+                        routed_experts=None,
+                        finish_reason="length",
+                        stop_reason=None,
+                    )
+                ],
+                prompt_token_ids=list(range(100)),
+                prompt_logprobs=None,
+                num_cached_tokens=30,
+                num_local_cached_tokens=20,
+                num_external_cached_tokens=10,
+                num_external_lookup_tokens=15,
+                num_external_retrieval_failure_tokens=5,
+            )
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        chunks = [
+            chunk
+            async for chunk in handler.generate_tokens(
+                PatchedTokensPrompt(prompt_token_ids=[1]),
+                SamplingParams(max_tokens=1),
+                "req-1",
+            )
+        ]
+
+        assert chunks[0]["finish_reason"] == "length"
+        payload = handler._prompt_source_publisher.publish.call_args.args[0]
+        assert payload["origin_router_id"] == 17
+        assert payload["registration_nonce"] == 23
+        assert payload["cache_source"] == {
+            "schema_version": 1,
+            "complete": True,
+            "prompt_tokens": 100,
+            "gpu_hit_tokens": 20,
+            "cpu_hit_tokens": 10,
+            "cpu_lookup_tokens": 15,
+            "retrieval_failure_tokens": 5,
+            "recomputed_tokens": 70,
+        }
+        handler._prompt_source_publisher.publish.assert_called_once()
+        assert "req-1" not in handler._prompt_source_active_origins
+
+    @pytest.mark.asyncio
     async def test_generate_tokens_routed_experts_start_echoes_prompt_start(self):
         """routed_experts.start echoes SamplingParams.routed_experts_prompt_start
         (the offset vLLM trimmed) so the RL consumer can align the completion."""

@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import (
     Any,
     AsyncIterator,
@@ -1378,6 +1379,46 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     outcome.generated_history_incomplete_reason
                 ),
             }
+        )
+
+    def _publish_completed_prompt_source_output(
+        self,
+        request_id: str,
+        output: RequestOutput,
+        num_output_tokens: int,
+    ) -> None:
+        prompt_tokens = len(output.prompt_token_ids or ())
+        local = getattr(output, "num_local_cached_tokens", None)
+        external = getattr(output, "num_external_cached_tokens", None)
+        source_counts_valid = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (local, external)
+        )
+        computed = (
+            prompt_tokens - local - external
+            if source_counts_valid and local + external <= prompt_tokens
+            else None
+        )
+        self._publish_prompt_source_outcome(
+            SimpleNamespace(
+                request_id=getattr(output, "request_id", request_id),
+                external_request_id=request_id,
+                complete=True,
+                num_prompt_tokens=prompt_tokens,
+                num_local_cached_tokens=local,
+                num_external_cached_tokens=external,
+                num_external_lookup_tokens=getattr(
+                    output, "num_external_lookup_tokens", None
+                ),
+                num_external_retrieval_failure_tokens=getattr(
+                    output, "num_external_retrieval_failure_tokens", None
+                ),
+                num_computed_tokens=computed,
+                incomplete_reason=None,
+                num_computed_output_tokens=num_output_tokens,
+                num_unobserved_computed_output_tokens=0,
+                generated_history_incomplete_reason=None,
+            )
         )
 
     @functools.cached_property
@@ -3339,6 +3380,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
 
             total_output_tokens_by_index: dict[int, int] = {}
             raw_routed_experts_by_output: dict[int, Any] = {}
+            prompt_source_published = False
             # vLLM surfaces prompt_logprobs once (at end-of-prefill) and clears
             # them on subsequent chunks, so the generation-finish chunk often
             # carries None. Capture the first non-None payload and attach it to
@@ -3383,6 +3425,14 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                     prepared_outputs.append(
                         (output, output_idx, token_ids, finish_reason, stop_reason)
                     )
+
+                if getattr(res, "finished", False) and not prompt_source_published:
+                    self._publish_completed_prompt_source_output(
+                        request_id,
+                        res,
+                        sum(total_output_tokens_by_index.values()),
+                    )
+                    prompt_source_published = True
 
                 for (
                     output,
