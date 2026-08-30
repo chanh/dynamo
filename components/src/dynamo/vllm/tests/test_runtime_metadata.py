@@ -3,12 +3,19 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
 from dynamo.common.token_budget import TOKEN_BUDGET_RUNTIME_KEY
 from dynamo.llm import ModelInput, ModelType, WorkerType
+from dynamo.vllm.cache_info import (
+    CACHE_EVIDENCE_BARRIER_CAPABILITY,
+    CACHE_EVIDENCE_EPOCH_CAPABILITY,
+    CACHE_EVIDENCE_EPOCH_MEDIA,
+    CACHE_EVIDENCE_SERVING_INCARNATIONS,
+    publish_cache_evidence_barrier_capability,
+)
 from dynamo.vllm.capacity import get_metrics_model_name, get_spec_decode_runtime_data
 from dynamo.vllm.engine_generate import (
     VLLM_GENERATE_CAPABILITY,
@@ -66,6 +73,151 @@ def test_vllm_token_budget_matches_rejection_policy():
         "reject_prompt_overflow": True,
         "reject_total_overflow": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_cache_evidence_barrier_capability_requires_events_method_and_opt_in(
+    monkeypatch,
+):
+    monkeypatch.setenv("DYN_CACHE_LOSS_FUNNEL_ENABLED", "true")
+    runtime_config = SimpleNamespace(set_engine_specific=Mock())
+    large_incarnation = 2**63 + 123
+    engine = SimpleNamespace(
+        cache_evidence_barrier=Mock(),
+        cache_evidence_barrier_supported=AsyncMock(side_effect=[True, True]),
+        cache_evidence_serving_incarnation=AsyncMock(
+            side_effect=[101, large_incarnation]
+        ),
+    )
+    engine_args = SimpleNamespace(
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq"),
+        kv_transfer_config=None,
+    )
+
+    assert await publish_cache_evidence_barrier_capability(
+        runtime_config, engine, engine_args, True, (4, 2)
+    )
+    assert runtime_config.set_engine_specific.call_args_list == [
+        call(CACHE_EVIDENCE_BARRIER_CAPABILITY, json.dumps(True)),
+        call(
+            CACHE_EVIDENCE_SERVING_INCARNATIONS,
+            json.dumps({"4": "101", "5": str(large_incarnation)}),
+        ),
+    ]
+
+    runtime_config.set_engine_specific.reset_mock()
+    assert not await publish_cache_evidence_barrier_capability(
+        runtime_config, SimpleNamespace(), engine_args, True, (4, 2)
+    )
+    runtime_config.set_engine_specific.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cache_evidence_epoch_capability_advertises_media_per_global_dp_rank(
+    monkeypatch,
+):
+    monkeypatch.setenv("DYN_CACHE_LOSS_FUNNEL_ENABLED", "true")
+    runtime_config = SimpleNamespace(set_engine_specific=Mock())
+    engine = SimpleNamespace(
+        cache_evidence_barrier=Mock(),
+        cache_evidence_barrier_supported=AsyncMock(side_effect=[True, True]),
+        cache_evidence_serving_incarnation=AsyncMock(side_effect=[101, 202]),
+        cache_evidence_epoch_media=AsyncMock(
+            side_effect=[("GPU",), ("GPU", "CPU")]
+        ),
+        begin_cache_evidence_epoch=Mock(),
+        commit_cache_evidence_epoch=Mock(),
+        abort_cache_evidence_epoch=Mock(),
+    )
+    engine_args = SimpleNamespace(
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq"),
+        kv_transfer_config=None,
+    )
+
+    assert await publish_cache_evidence_barrier_capability(
+        runtime_config, engine, engine_args, True, (4, 2)
+    )
+    values = {
+        key: json.loads(value)
+        for key, value in (call.args for call in runtime_config.set_engine_specific.call_args_list)
+    }
+    assert values[CACHE_EVIDENCE_EPOCH_CAPABILITY] is True
+    assert values[CACHE_EVIDENCE_EPOCH_MEDIA] == {
+        "4": ["GPU"],
+        "5": ["CPU", "GPU"],
+    }
+    assert values[CACHE_EVIDENCE_SERVING_INCARNATIONS] == {
+        "4": "101",
+        "5": "202",
+    }
+
+    runtime_config.set_engine_specific.reset_mock()
+    engine_args.kv_events_config.publisher = "null"
+    assert not await publish_cache_evidence_barrier_capability(
+        runtime_config, engine, engine_args, True, (4, 2)
+    )
+    runtime_config.set_engine_specific.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transfer_config", "actual_support", "expected"),
+    [
+        (None, True, True),
+        (
+            SimpleNamespace(
+                kv_connector="OffloadingConnector",
+                kv_connector_extra_config={"self_describing_kv_events": True},
+            ),
+            True,
+            True,
+        ),
+        (
+            SimpleNamespace(
+                kv_connector="OffloadingConnector",
+                kv_connector_extra_config={"self_describing_kv_events": False},
+            ),
+            False,
+            False,
+        ),
+    ],
+    ids=("connector-absent", "self-describing", "not-self-describing"),
+)
+async def test_cache_evidence_capability_uses_actual_engine_support(
+    monkeypatch, transfer_config, actual_support, expected
+):
+    monkeypatch.setenv("DYN_CACHE_LOSS_FUNNEL_ENABLED", "true")
+    runtime_config = SimpleNamespace(set_engine_specific=Mock())
+    engine = SimpleNamespace(
+        cache_evidence_barrier=Mock(),
+        cache_evidence_barrier_supported=AsyncMock(return_value=actual_support),
+        cache_evidence_serving_incarnation=AsyncMock(return_value=101),
+    )
+    engine_args = SimpleNamespace(
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq"),
+        kv_transfer_config=transfer_config,
+    )
+
+    assert (
+        await publish_cache_evidence_barrier_capability(
+            runtime_config, engine, engine_args, True, (0, 1)
+        )
+        is expected
+    )
+    engine.cache_evidence_barrier_supported.assert_awaited_once_with(
+        data_parallel_rank=0
+    )
+    if expected:
+        assert runtime_config.set_engine_specific.call_args_list == [
+            call(CACHE_EVIDENCE_BARRIER_CAPABILITY, json.dumps(True)),
+            call(
+                CACHE_EVIDENCE_SERVING_INCARNATIONS,
+                json.dumps({"0": "101"}),
+            ),
+        ]
+    else:
+        runtime_config.set_engine_specific.assert_not_called()
+        engine.cache_evidence_serving_incarnation.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

@@ -53,7 +53,10 @@ from dynamo.vllm.worker_factory import WorkerFactory
 
 from . import envs
 from .args import Config, _uses_dynamo_connector, configure_rl_logprobs_mode, parse_args
-from .cache_info import get_configured_kv_event_block_size
+from .cache_info import (
+    get_configured_kv_event_block_size,
+    publish_cache_evidence_barrier_capability,
+)
 from .capacity import (
     get_metrics_model_name,
     get_spec_decode_runtime_data,
@@ -742,6 +745,13 @@ async def register_vllm_model(
     apply_data_parallel_runtime_config(runtime_config, dp_range)
     enable_router_hint_support(
         runtime_config, config.engine_args, worker_type, dp_range
+    )
+    await publish_cache_evidence_barrier_capability(
+        runtime_config,
+        engine_client,
+        config.engine_args,
+        bool(config.use_kv_events),
+        dp_range,
     )
     runtime_config.context_length = vllm_config.model_config.max_model_len
     if publish_engine_generate_capability(

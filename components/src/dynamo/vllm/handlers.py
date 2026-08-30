@@ -88,7 +88,10 @@ from dynamo.vllm.kv_connector_protocols import (
 from dynamo.vllm.router_hints import enable_router_hint_support
 
 from .args import Config
-from .cache_info import get_configured_kv_event_block_size
+from .cache_info import (
+    get_configured_kv_event_block_size,
+    publish_cache_evidence_barrier_capability,
+)
 from .capacity import publish_vllm_token_budget
 from .constants import DisaggregationMode, EmbeddingTransferMode
 from .dp_topology import get_dp_range_for_worker
@@ -2229,6 +2232,178 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         except Exception as e:
             yield {"status": "error", "message": str(e)}
 
+    async def cache_evidence_barrier(self, request=None):
+        if not isinstance(request, dict):
+            yield {"status": "error", "message": "barrier request must be an object"}
+            return
+        barrier_id = request.get("barrier_id")
+        dp_rank = request.get("data_parallel_rank")
+        if (
+            isinstance(barrier_id, bool)
+            or not isinstance(barrier_id, int)
+            or barrier_id <= 0
+            or isinstance(dp_rank, bool)
+            or not isinstance(dp_rank, int)
+            or not self.dp_range[0] <= dp_rank < self.dp_range[0] + self.dp_range[1]
+        ):
+            yield {"status": "error", "message": "invalid cache-evidence barrier"}
+            return
+        try:
+            await self.engine_client.cache_evidence_barrier(
+                barrier_id, data_parallel_rank=dp_rank
+            )
+            yield {"status": "success", "barrier_id": barrier_id}
+        except Exception as error:
+            response = {
+                "status": "error",
+                "barrier_id": barrier_id,
+                "message": str(error),
+            }
+            code = getattr(error, "code", None)
+            if isinstance(code, str):
+                response["code"] = code
+            yield response
+
+    def _cache_evidence_epoch_request(self, request, *, begin: bool):
+        if not isinstance(request, dict):
+            raise ValueError("cache-evidence epoch request must be an object")
+        epoch_id = request.get("epoch_id")
+        dp_rank = request.get("data_parallel_rank")
+        if (
+            not isinstance(epoch_id, str)
+            or len(epoch_id) != 32
+            or any(char not in "0123456789abcdef" for char in epoch_id)
+            or isinstance(dp_rank, bool)
+            or not isinstance(dp_rank, int)
+            or not self.dp_range[0] <= dp_rank < self.dp_range[0] + self.dp_range[1]
+        ):
+            raise ValueError("invalid cache-evidence epoch token or rank")
+        if not begin:
+            return epoch_id, dp_rank, None
+        barrier_id = request.get("barrier_id")
+        serving_incarnation = request.get("serving_incarnation")
+        issued_at_unix_ms = request.get("issued_at_unix_ms")
+        deadline_unix_ms = request.get("deadline_unix_ms")
+        lease_ms = request.get("lease_ms")
+        integers = (
+            barrier_id,
+            serving_incarnation,
+            issued_at_unix_ms,
+            deadline_unix_ms,
+            lease_ms,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in integers):
+            raise ValueError("invalid cache-evidence epoch metadata")
+        if (
+            barrier_id <= 0
+            or serving_incarnation <= 0
+            or issued_at_unix_ms <= 0
+            or deadline_unix_ms <= issued_at_unix_ms
+            or deadline_unix_ms <= time.time_ns() // 1_000_000
+            or deadline_unix_ms - issued_at_unix_ms > 30_000
+            or lease_ms != deadline_unix_ms - issued_at_unix_ms
+        ):
+            raise ValueError("invalid or expired cache-evidence epoch metadata")
+        return epoch_id, dp_rank, (
+            barrier_id,
+            serving_incarnation,
+            issued_at_unix_ms,
+            deadline_unix_ms,
+            lease_ms,
+        )
+
+    async def begin_cache_evidence_epoch(self, request=None):
+        try:
+            epoch_id, dp_rank, metadata = self._cache_evidence_epoch_request(
+                request, begin=True
+            )
+            assert metadata is not None
+            (
+                barrier_id,
+                serving_incarnation,
+                issued_at_unix_ms,
+                deadline_unix_ms,
+                lease_ms,
+            ) = metadata
+            current_incarnation = (
+                await self.engine_client.cache_evidence_serving_incarnation(
+                    data_parallel_rank=dp_rank
+                )
+            )
+            if current_incarnation != serving_incarnation:
+                logger.error(
+                    "Cache-evidence serving incarnation mismatch for data parallel "
+                    "rank %d: requested=%d current=%d",
+                    dp_rank,
+                    serving_incarnation,
+                    current_incarnation,
+                )
+                raise ValueError("cache-evidence serving incarnation mismatch")
+            cleared_media = await self.engine_client.cache_evidence_epoch_media(
+                data_parallel_rank=dp_rank
+            )
+            if set(cleared_media) not in ({"GPU"}, {"GPU", "CPU"}):
+                raise ValueError("invalid cache-evidence epoch media")
+            await self.engine_client.begin_cache_evidence_epoch(
+                epoch_id,
+                barrier_id,
+                lease_ms,
+                serving_incarnation,
+                issued_at_unix_ms,
+                deadline_unix_ms,
+                data_parallel_rank=dp_rank,
+            )
+            yield {
+                "status": "success",
+                "epoch_id": epoch_id,
+                "barrier_id": barrier_id,
+                "serving_incarnation": serving_incarnation,
+                "cleared_media": sorted(set(cleared_media)),
+            }
+        except Exception as error:
+            response = {"status": "error", "message": str(error)}
+            if isinstance(request, dict):
+                response.update(
+                    {
+                        key: request[key]
+                        for key in ("epoch_id", "barrier_id", "serving_incarnation")
+                        if key in request
+                    }
+                )
+            code = getattr(error, "code", None)
+            if isinstance(code, str):
+                response["code"] = code
+            yield response
+
+    async def _finish_cache_evidence_epoch(self, request, *, commit: bool):
+        try:
+            epoch_id, dp_rank, _ = self._cache_evidence_epoch_request(
+                request, begin=False
+            )
+            operation = (
+                self.engine_client.commit_cache_evidence_epoch
+                if commit
+                else self.engine_client.abort_cache_evidence_epoch
+            )
+            await operation(epoch_id, data_parallel_rank=dp_rank)
+            yield {"status": "success", "epoch_id": epoch_id}
+        except Exception as error:
+            response = {"status": "error", "message": str(error)}
+            if isinstance(request, dict) and "epoch_id" in request:
+                response["epoch_id"] = request["epoch_id"]
+            code = getattr(error, "code", None)
+            if isinstance(code, str):
+                response["code"] = code
+            yield response
+
+    async def commit_cache_evidence_epoch(self, request=None):
+        async for response in self._finish_cache_evidence_epoch(request, commit=True):
+            yield response
+
+    async def abort_cache_evidence_epoch(self, request=None):
+        async for response in self._finish_cache_evidence_epoch(request, commit=False):
+            yield response
+
     async def get_perf_metrics(self, request=None):
         """Return self-benchmark FPM results, or an error dict if none."""
         result = getattr(self, "_benchmark_results", None)
@@ -2367,6 +2542,13 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             runtime_config,
             self.config.engine_args,
             lora_worker_type,
+            self.dp_range,
+        )
+        await publish_cache_evidence_barrier_capability(
+            runtime_config,
+            self.engine_client,
+            self.config.engine_args,
+            bool(getattr(self.config, "use_kv_events", False)),
             self.dp_range,
         )
         runtime_config.context_length = self.model_max_len

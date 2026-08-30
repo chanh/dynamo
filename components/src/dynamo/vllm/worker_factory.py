@@ -1131,6 +1131,18 @@ class WorkerFactory:
         clear_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.clear_kv_blocks"
         )
+        barrier_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.cache_evidence_barrier"
+        )
+        epoch_begin_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.begin_cache_evidence_epoch"
+        )
+        epoch_commit_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.commit_cache_evidence_epoch"
+        )
+        epoch_abort_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.abort_cache_evidence_epoch"
+        )
         rl_endpoint = (
             runtime.endpoint(f"{config.namespace}.{config.component}.rl")
             if config.enable_rl
@@ -1140,6 +1152,10 @@ class WorkerFactory:
         shutdown_endpoints[:] = [
             generate_endpoint,
             clear_endpoint,
+            barrier_endpoint,
+            epoch_begin_endpoint,
+            epoch_commit_endpoint,
+            epoch_abort_endpoint,
         ]
         if rl_endpoint is not None:
             shutdown_endpoints.append(rl_endpoint)
@@ -1385,6 +1401,22 @@ class WorkerFactory:
                     handler.clear_kv_blocks,
                     metrics_labels=model_metrics_labels,
                 ),
+                barrier_endpoint.serve_endpoint(
+                    handler.cache_evidence_barrier,
+                    metrics_labels=model_metrics_labels,
+                ),
+                epoch_begin_endpoint.serve_endpoint(
+                    handler.begin_cache_evidence_epoch,
+                    metrics_labels=model_metrics_labels,
+                ),
+                epoch_commit_endpoint.serve_endpoint(
+                    handler.commit_cache_evidence_epoch,
+                    metrics_labels=model_metrics_labels,
+                ),
+                epoch_abort_endpoint.serve_endpoint(
+                    handler.abort_cache_evidence_epoch,
+                    metrics_labels=model_metrics_labels,
+                ),
                 perf_endpoint.serve_endpoint(
                     handler.get_perf_metrics,
                     metrics_labels=model_metrics_labels,
@@ -1459,6 +1491,18 @@ class WorkerFactory:
         )
         clear_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.clear_kv_blocks"
+        )
+        barrier_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.cache_evidence_barrier"
+        )
+        epoch_begin_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.begin_cache_evidence_epoch"
+        )
+        epoch_commit_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.commit_cache_evidence_epoch"
+        )
+        epoch_abort_endpoint = runtime.endpoint(
+            f"{config.namespace}.{config.component}.abort_cache_evidence_epoch"
         )
         rl_endpoint = (
             runtime.endpoint(f"{config.namespace}.{config.component}.rl")
@@ -1591,7 +1635,15 @@ class WorkerFactory:
         perf_endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.get_perf_metrics"
         )
-        shutdown_endpoints[:] = [generate_endpoint, clear_endpoint, perf_endpoint]
+        shutdown_endpoints[:] = [
+            generate_endpoint,
+            clear_endpoint,
+            barrier_endpoint,
+            epoch_begin_endpoint,
+            epoch_commit_endpoint,
+            epoch_abort_endpoint,
+            perf_endpoint,
+        ]
         if rl_endpoint is not None:
             shutdown_endpoints.append(rl_endpoint)
         if lora_enabled:
@@ -1657,6 +1709,22 @@ class WorkerFactory:
                 ),
                 clear_endpoint.serve_endpoint(
                     handler.clear_kv_blocks,  # type: ignore
+                    metrics_labels=prefill_metrics_labels,
+                ),
+                barrier_endpoint.serve_endpoint(
+                    handler.cache_evidence_barrier,  # type: ignore
+                    metrics_labels=prefill_metrics_labels,
+                ),
+                epoch_begin_endpoint.serve_endpoint(
+                    handler.begin_cache_evidence_epoch,  # type: ignore
+                    metrics_labels=prefill_metrics_labels,
+                ),
+                epoch_commit_endpoint.serve_endpoint(
+                    handler.commit_cache_evidence_epoch,  # type: ignore
+                    metrics_labels=prefill_metrics_labels,
+                ),
+                epoch_abort_endpoint.serve_endpoint(
+                    handler.abort_cache_evidence_epoch,  # type: ignore
                     metrics_labels=prefill_metrics_labels,
                 ),
                 perf_endpoint.serve_endpoint(

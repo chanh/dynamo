@@ -173,6 +173,139 @@ async def test_clear_kv_blocks_reports_reset_failure():
     )
 
 
+@pytest.mark.asyncio
+async def test_cache_evidence_barrier_targets_global_dp_rank():
+    handler = _make_handler()
+    handler.dp_range = (4, 2)
+    handler.engine_client = SimpleNamespace(cache_evidence_barrier=AsyncMock())
+
+    chunks = [
+        chunk
+        async for chunk in handler.cache_evidence_barrier(
+            {"barrier_id": 41, "data_parallel_rank": 5}
+        )
+    ]
+
+    assert chunks == [{"status": "success", "barrier_id": 41}]
+    handler.engine_client.cache_evidence_barrier.assert_awaited_once_with(
+        41, data_parallel_rank=5
+    )
+
+
+@pytest.mark.asyncio
+async def test_cache_evidence_barrier_reports_permanent_unavailability_code():
+    class PermanentlyUnavailable(RuntimeError):
+        code = "barrier_permanently_unavailable"
+
+    handler = _make_handler()
+    handler.dp_range = (4, 2)
+    handler.engine_client = SimpleNamespace(
+        cache_evidence_barrier=AsyncMock(side_effect=PermanentlyUnavailable("invalidated"))
+    )
+
+    chunks = [
+        chunk
+        async for chunk in handler.cache_evidence_barrier(
+            {"barrier_id": 41, "data_parallel_rank": 5}
+        )
+    ]
+
+    assert chunks == [
+        {
+            "status": "error",
+            "code": "barrier_permanently_unavailable",
+            "barrier_id": 41,
+            "message": "invalidated",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cache_evidence_epoch_binds_requested_global_dp_rank_incarnation():
+    handler = _make_handler()
+    handler.dp_range = (4, 2)
+    handler.engine_client = SimpleNamespace(
+        cache_evidence_serving_incarnation=AsyncMock(return_value=202),
+        cache_evidence_epoch_media=AsyncMock(return_value=("GPU", "CPU")),
+        begin_cache_evidence_epoch=AsyncMock(),
+    )
+    request = {
+        "epoch_id": "0123456789abcdef0123456789abcdef",
+        "barrier_id": 41,
+        "lease_ms": 30_000,
+        "serving_incarnation": 202,
+        "issued_at_unix_ms": 2_000_000_000_000,
+        "deadline_unix_ms": 2_000_000_030_000,
+        "data_parallel_rank": 5,
+    }
+
+    with patch.object(mod.time, "time_ns", return_value=1_999_999_999_000_000_000):
+        chunks = [
+            chunk async for chunk in handler.begin_cache_evidence_epoch(request)
+        ]
+
+    assert chunks == [
+        {
+            "status": "success",
+            "epoch_id": request["epoch_id"],
+            "barrier_id": 41,
+            "serving_incarnation": 202,
+            "cleared_media": ["CPU", "GPU"],
+        }
+    ]
+    handler.engine_client.begin_cache_evidence_epoch.assert_awaited_once_with(
+        request["epoch_id"],
+        41,
+        30_000,
+        202,
+        request["issued_at_unix_ms"],
+        request["deadline_unix_ms"],
+        data_parallel_rank=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cache_evidence_epoch_logs_incarnation_mismatch(caplog):
+    handler = _make_handler()
+    handler.dp_range = (4, 2)
+    handler.engine_client = SimpleNamespace(
+        cache_evidence_serving_incarnation=AsyncMock(return_value=303),
+        cache_evidence_epoch_media=AsyncMock(),
+        begin_cache_evidence_epoch=AsyncMock(),
+    )
+    request = {
+        "epoch_id": "0123456789abcdef0123456789abcdef",
+        "barrier_id": 41,
+        "lease_ms": 30_000,
+        "serving_incarnation": 202,
+        "issued_at_unix_ms": 2_000_000_000_000,
+        "deadline_unix_ms": 2_000_000_030_000,
+        "data_parallel_rank": 5,
+    }
+
+    with (
+        patch.object(mod.time, "time_ns", return_value=1_999_999_999_000_000_000),
+        caplog.at_level("ERROR", logger=mod.__name__),
+    ):
+        chunks = [chunk async for chunk in handler.begin_cache_evidence_epoch(request)]
+
+    assert chunks == [
+        {
+            "status": "error",
+            "message": "cache-evidence serving incarnation mismatch",
+            "epoch_id": request["epoch_id"],
+            "barrier_id": 41,
+            "serving_incarnation": 202,
+        }
+    ]
+    assert (
+        "Cache-evidence serving incarnation mismatch for data parallel rank 5: "
+        "requested=202 current=303"
+    ) in caplog.messages
+    handler.engine_client.cache_evidence_epoch_media.assert_not_awaited()
+    handler.engine_client.begin_cache_evidence_epoch.assert_not_awaited()
+
+
 class TestReasoningParserForwarding:
     def test_request_reasoning_metadata_reads_extra_args(self):
         request = {
