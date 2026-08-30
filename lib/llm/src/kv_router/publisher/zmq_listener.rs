@@ -34,6 +34,7 @@ struct SourceSequenceTracker {
 // consumer bound would make otherwise supported CPU-cache churn permanently
 // incomplete before the producer reaches its own safety limit.
 const MAX_EVIDENCE_HASH_MAPPINGS: usize = 4_000_000;
+const PARENT_SEQUENCE_HASH_ALGORITHM: &str = "dynamo_xxh3_u32le_seed1337_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvidenceHashMapping {
@@ -558,6 +559,8 @@ fn cache_evidence_mutation_with_resolver(
         RawKvEvent::BlockStored {
             block_hashes,
             parent_block_hash,
+            parent_sequence_hash,
+            parent_sequence_hash_algorithm,
             token_ids,
             block_size,
             medium,
@@ -568,6 +571,17 @@ fn cache_evidence_mutation_with_resolver(
             group_idx,
             ..
         } => {
+            let parent_sequence_hash = match (
+                parent_sequence_hash,
+                parent_sequence_hash_algorithm.as_deref(),
+            ) {
+                (None, None) => None,
+                (Some(hash), Some(PARENT_SEQUENCE_HASH_ALGORITHM)) => Some(hash.into_u64()),
+                _ => return Err(EvidenceMutationError::Invalid),
+            };
+            if parent_sequence_hash.is_some() && parent_block_hash.is_none() {
+                return Err(EvidenceMutationError::Invalid);
+            }
             let external_hashes: Vec<_> = block_hashes
                 .iter()
                 .copied()
@@ -611,12 +625,24 @@ fn cache_evidence_mutation_with_resolver(
                 }
                 stored
             };
-            Ok(Some(CacheEvidenceMutation::Store {
-                tier: store_tier,
-                group_idx: *group_idx,
-                parent_external_hash: parent_block_hash.map(BlockHashValue::into_u64),
-                blocks: stored,
-            }))
+            if let Some(parent_sequence_hash) = parent_sequence_hash {
+                Ok(Some(CacheEvidenceMutation::StoreWithParentAttestation {
+                    tier: store_tier,
+                    group_idx: group_idx.ok_or(EvidenceMutationError::Invalid)?,
+                    parent_external_hash: parent_block_hash
+                        .ok_or(EvidenceMutationError::Invalid)?
+                        .into_u64(),
+                    parent_sequence_hash,
+                    blocks: stored,
+                }))
+            } else {
+                Ok(Some(CacheEvidenceMutation::Store {
+                    tier: store_tier,
+                    group_idx: *group_idx,
+                    parent_external_hash: parent_block_hash.map(BlockHashValue::into_u64),
+                    blocks: stored,
+                }))
+            }
         }
         RawKvEvent::BlockRemoved {
             block_hashes,
@@ -652,7 +678,7 @@ fn cache_evidence_mutation_with_resolver(
 mod tests {
     use super::*;
     use dynamo_kv_router::cache_loss::{
-        CacheEvidenceLedger, CacheGroupHashSequence, CacheGroupKind, KnownPrefixLength,
+        CacheEvidenceLedger, CacheGroupHashSequence, CacheGroupKind, KnownBool, KnownPrefixLength,
     };
 
     const TEST_OWNER: CacheOwner = CacheOwner {
@@ -676,6 +702,8 @@ mod tests {
                 .map(BlockHashValue::Unsigned)
                 .collect(),
             parent_block_hash: parent_block_hash.map(BlockHashValue::Unsigned),
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: token_ids.to_vec(),
             block_size,
             medium: Some("CPU".to_string()),
@@ -707,6 +735,8 @@ mod tests {
         RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(external_hash)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids,
             block_size,
             medium: Some(medium.to_string()),
@@ -1024,6 +1054,8 @@ mod tests {
         let event = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(42)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![1; 8],
             block_size: 8,
             medium: None,
@@ -1055,6 +1087,174 @@ mod tests {
                 }],
             }))
         );
+    }
+
+    #[test]
+    fn evidence_accepts_only_complete_known_parent_attestation_pair() {
+        let mut event = constituent_store(
+            4,
+            8,
+            &[42],
+            Some(41),
+            &[1; 8],
+            KvCacheSpecKind::SlidingWindow,
+            Some(128),
+        );
+        if let RawKvEvent::BlockStored {
+            parent_sequence_hash,
+            parent_sequence_hash_algorithm,
+            ..
+        } = &mut event
+        {
+            *parent_sequence_hash = Some(BlockHashValue::Unsigned(u64::MAX));
+            *parent_sequence_hash_algorithm = Some(PARENT_SEQUENCE_HASH_ALGORITHM.to_string());
+        }
+        assert!(matches!(
+            cache_evidence_mutation(&event, None, &Arc::new(AtomicU32::new(0))),
+            Ok(Some(CacheEvidenceMutation::StoreWithParentAttestation {
+                group_idx: 4,
+                parent_external_hash: 41,
+                parent_sequence_hash: u64::MAX,
+                ..
+            }))
+        ));
+
+        if let RawKvEvent::BlockStored {
+            parent_sequence_hash_algorithm,
+            ..
+        } = &mut event
+        {
+            *parent_sequence_hash_algorithm = Some("unknown".to_string());
+        }
+        assert_eq!(
+            cache_evidence_mutation(&event, None, &Arc::new(AtomicU32::new(0))),
+            Err(EvidenceMutationError::Invalid)
+        );
+        if let RawKvEvent::BlockStored {
+            parent_sequence_hash_algorithm,
+            ..
+        } = &mut event
+        {
+            *parent_sequence_hash_algorithm = None;
+        }
+        assert_eq!(
+            cache_evidence_mutation(&event, None, &Arc::new(AtomicU32::new(0))),
+            Err(EvidenceMutationError::Invalid)
+        );
+    }
+
+    #[test]
+    fn producer_golden_vectors_preserve_attested_child_sequences() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "BlockStored",
+                    "block_hashes": [101],
+                    "parent_block_hash": 100,
+                    "parent_sequence_hash": 14643705804678351452_u64,
+                    "parent_sequence_hash_algorithm": PARENT_SEQUENCE_HASH_ALGORITHM,
+                    "token_ids": [5, 6, 7, 8],
+                    "block_size": 4,
+                    "medium": "CPU",
+                    "group_idx": 1,
+                    "kv_cache_spec_kind": "full_attention"
+                }),
+                1,
+                vec![4945711292740353085_u64],
+            ),
+            (
+                serde_json::json!({
+                    "type": "BlockStored",
+                    "block_hashes": [201],
+                    "parent_block_hash": 200,
+                    "parent_sequence_hash": 9967753091837871098_u64,
+                    "parent_sequence_hash_algorithm": PARENT_SEQUENCE_HASH_ALGORITHM,
+                    "token_ids": [5, 6, 7, 8],
+                    "block_size": 4,
+                    "medium": "CPU",
+                    "lora_name": "adapter-a",
+                    "cache_salt": "tenant-a",
+                    "group_idx": 4,
+                    "kv_cache_spec_kind": "full_attention"
+                }),
+                4,
+                vec![8253787442643436499_u64],
+            ),
+            (
+                serde_json::json!({
+                    "type": "BlockStored",
+                    "block_hashes": [301],
+                    "parent_block_hash": 300,
+                    "parent_sequence_hash": 1914873892905420881_u64,
+                    "parent_sequence_hash_algorithm": PARENT_SEQUENCE_HASH_ALGORITHM,
+                    "token_ids": [[5, 6], [6, 7], [7, 8], [8, 9]],
+                    "block_size": 4,
+                    "medium": "CPU",
+                    "group_idx": 3,
+                    "kv_cache_spec_kind": "full_attention"
+                }),
+                3,
+                vec![13136491855314414045_u64],
+            ),
+            (
+                serde_json::json!({
+                    "type": "BlockStored",
+                    "block_hashes": [401, 402, 403],
+                    "parent_block_hash": 400,
+                    "parent_sequence_hash": 1921452330601040443_u64,
+                    "parent_sequence_hash_algorithm": PARENT_SEQUENCE_HASH_ALGORITHM,
+                    "token_ids": [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+                    "block_size": 4,
+                    "medium": "CPU",
+                    "group_idx": 1,
+                    "kv_cache_spec_kind": "full_attention"
+                }),
+                1,
+                vec![
+                    16910271745392797383_u64,
+                    1149017327988146166_u64,
+                    4629705925025678689_u64,
+                ],
+            ),
+        ];
+
+        for (wire, group, expected_children) in cases {
+            let encoded = rmp_serde::to_vec_named(&wire).unwrap();
+            let event: RawKvEvent = rmp_serde::from_slice(&encoded).unwrap();
+            let mutation = cache_evidence_mutation(&event, None, &Arc::new(AtomicU32::new(0)))
+                .unwrap()
+                .unwrap();
+            let mut ledger = CacheEvidenceLedger::new(32);
+            ledger.record_group_catalog(TEST_OWNER, CacheTier::Cpu, [group]);
+            ledger.seal_physical_scope();
+            let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+                owner: TEST_OWNER,
+                source_cursor: 1,
+                source_incarnation_id: None,
+                heartbeat: false,
+                watermark_source_cursor: None,
+                mutations: vec![mutation],
+                barrier_id: None,
+                epoch_id: None,
+                telemetry_complete: true,
+            });
+
+            assert!(result.is_complete());
+            for child in expected_children {
+                assert_eq!(ledger.resident_on(child, TEST_OWNER), KnownBool::Yes);
+            }
+            let RawKvEvent::BlockStored {
+                parent_sequence_hash: Some(parent),
+                ..
+            } = event
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                ledger.resident_on(parent.into_u64(), TEST_OWNER),
+                KnownBool::No
+            );
+        }
     }
 
     #[test]

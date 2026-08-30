@@ -125,6 +125,10 @@ pub enum RawKvEvent {
         /// We normalize them to `u64` while deserializing to support both producers.
         block_hashes: Vec<BlockHashValue>,
         parent_block_hash: Option<BlockHashValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_sequence_hash: Option<BlockHashValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_sequence_hash_algorithm: Option<String>,
         token_ids: Vec<u32>,
         block_size: usize,
         #[serde(skip_serializing_if = "Option::is_none")]

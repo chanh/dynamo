@@ -81,6 +81,8 @@ pub fn convert_event(
             kv_cache_spec_sliding_window: _,
             locality: _,
             ownership: _,
+            parent_sequence_hash: _,
+            parent_sequence_hash_algorithm: _,
         } => {
             // Reject self-referencing blocks: all block hashes (including parent) must be unique.
             {

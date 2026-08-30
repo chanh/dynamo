@@ -2051,6 +2051,8 @@ mod tests {
         RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(block)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![10, 11, 12, 13],
             block_size: 4,
             medium: medium.map(str::to_owned),

@@ -2515,7 +2515,11 @@ async fn run_cache_evidence_subscriber(
                         let clear = matches!(mutation, CacheEvidenceMutation::Clear { tier: None });
                         let unresolved = hashes.is_empty()
                             && match mutation {
-                                CacheEvidenceMutation::Store { blocks, .. } => !blocks.is_empty(),
+                                CacheEvidenceMutation::Store { blocks, .. }
+                                | CacheEvidenceMutation::StoreWithParentAttestation {
+                                    blocks,
+                                    ..
+                                } => !blocks.is_empty(),
                                 CacheEvidenceMutation::Remove { block_hashes, .. } => {
                                     !block_hashes.is_empty()
                                 }
@@ -2548,7 +2552,8 @@ async fn run_cache_evidence_subscriber(
                     metrics.observe_batch("applied");
                     for mutation in &batch.mutations {
                         match mutation {
-                            CacheEvidenceMutation::Store { tier, .. } => {
+                            CacheEvidenceMutation::Store { tier, .. }
+                            | CacheEvidenceMutation::StoreWithParentAttestation { tier, .. } => {
                                 metrics.observe_mutation("store", cache_tier_label(*tier));
                             }
                             CacheEvidenceMutation::Remove { tier, .. } => {
@@ -2858,6 +2863,8 @@ mod tests {
         RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(42)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![1, 2],
             block_size: 2,
             medium: Some(medium.to_string()),

@@ -302,6 +302,8 @@ mod test_event_processing {
         let raw_evt = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10), BlockHashValue::Unsigned(11)],
             parent_block_hash: Some(BlockHashValue::Unsigned(99)),
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![1, 2, 3, 4, 5, 6, 7, 8],
             block_size: 4,
             medium: None,
@@ -336,6 +338,8 @@ mod test_event_processing {
         let base_evt = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: token_ids.clone(),
             block_size: 4,
             medium: None,
@@ -352,6 +356,8 @@ mod test_event_processing {
         let lora_evt = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: token_ids.clone(),
             block_size: 4,
             medium: None,
@@ -409,6 +415,8 @@ mod test_event_processing {
         let evt1 = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: token_ids.clone(),
             block_size: 4,
             medium: None,
@@ -425,6 +433,8 @@ mod test_event_processing {
         let evt2 = RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(10)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: token_ids.clone(),
             block_size: 4,
             medium: None,
@@ -1636,6 +1646,8 @@ mod tests_startup_helpers {
                 kv_cache_spec_sliding_window: None,
                 locality: None,
                 ownership: None,
+                parent_sequence_hash: None,
+                parent_sequence_hash_algorithm: None,
             }],
             data_parallel_rank: Some(0),
             barrier_id: None,

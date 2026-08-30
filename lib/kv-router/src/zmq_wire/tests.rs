@@ -143,6 +143,10 @@ struct MapBlockStoredFixture {
     event_type: &'static str,
     block_hashes: Vec<BlockHashValue>,
     parent_block_hash: Option<BlockHashValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_sequence_hash: Option<BlockHashValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_sequence_hash_algorithm: Option<String>,
     token_ids: Vec<u32>,
     block_size: usize,
     medium: Option<String>,
@@ -163,6 +167,8 @@ impl Default for MapBlockStoredFixture {
             event_type: "BlockStored",
             block_hashes: vec![BlockHashValue::Unsigned(11)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![10, 11],
             block_size: 2,
             medium: None,
@@ -173,6 +179,34 @@ impl Default for MapBlockStoredFixture {
             ownership: None,
         }
     }
+}
+
+#[test]
+fn decodes_optional_parent_sequence_attestation_on_named_map_events() {
+    let encoded = to_vec_named(&MapBlockStoredFixture {
+        parent_block_hash: Some(BlockHashValue::Unsigned(10)),
+        parent_sequence_hash: Some(BlockHashValue::Unsigned(u64::MAX)),
+        parent_sequence_hash_algorithm: Some("dynamo_xxh3_u32le_seed1337_v1".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    let event: RawKvEvent = from_slice(&encoded).unwrap();
+    let RawKvEvent::BlockStored {
+        parent_sequence_hash,
+        parent_sequence_hash_algorithm,
+        ..
+    } = event
+    else {
+        panic!("expected BlockStored");
+    };
+    assert_eq!(
+        parent_sequence_hash.map(BlockHashValue::into_u64),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        parent_sequence_hash_algorithm.as_deref(),
+        Some("dynamo_xxh3_u32le_seed1337_v1")
+    );
 }
 
 #[derive(Serialize)]
@@ -808,6 +842,8 @@ fn test_normalizer_propagates_cache_namespace_from_parent() {
     let parent = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(1)],
         parent_block_hash: None,
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![10, 11],
         block_size: 2,
         medium: None,
@@ -824,6 +860,8 @@ fn test_normalizer_propagates_cache_namespace_from_parent() {
     let child = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(2)],
         parent_block_hash: Some(BlockHashValue::Unsigned(1)),
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![12, 13],
         block_size: 2,
         medium: None,
@@ -869,6 +907,8 @@ fn test_normalizer_shares_cache_namespace_across_blocks() {
     let event = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(1), BlockHashValue::Unsigned(2)],
         parent_block_hash: None,
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![10, 11, 12, 13],
         block_size: 2,
         medium: None,
@@ -902,6 +942,8 @@ fn test_normalizer_rejects_ambiguous_parent_cache_namespace() {
         |cache_namespace: Option<&str>, block_hashes, parent_block_hash| RawKvEvent::BlockStored {
             block_hashes,
             parent_block_hash,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![10, 11],
             block_size: 2,
             medium: None,
@@ -941,6 +983,8 @@ fn test_normalizer_treats_empty_namespace_as_absent() {
     let parent = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(1)],
         parent_block_hash: None,
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![10, 11],
         block_size: 2,
         medium: None,
@@ -957,6 +1001,8 @@ fn test_normalizer_treats_empty_namespace_as_absent() {
     let child = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(2)],
         parent_block_hash: Some(BlockHashValue::Unsigned(1)),
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![12, 13],
         block_size: 2,
         medium: None,
@@ -1004,6 +1050,8 @@ fn test_convert_event_bigram_emits_eagle_windows() {
     let raw_event = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(21), BlockHashValue::Unsigned(22)],
         parent_block_hash: None,
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![10, 11, 12, 13, 14],
         block_size: 2,
         medium: None,
@@ -1079,6 +1127,8 @@ fn cpu_block_stored(fixture: CpuBlockStoredFixture<'_>) -> RawKvEvent {
             .map(BlockHashValue::Unsigned)
             .collect(),
         parent_block_hash: fixture.parent_block_hash.map(BlockHashValue::Unsigned),
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: fixture.token_ids.to_vec(),
         block_size: fixture.block_size,
         medium: Some("CPU".to_string()),
@@ -1314,6 +1364,8 @@ fn raw_placement_event(
         TestEventKind::BlockStored => RawKvEvent::BlockStored {
             block_hashes: vec![BlockHashValue::Unsigned(1)],
             parent_block_hash: None,
+            parent_sequence_hash: None,
+            parent_sequence_hash_algorithm: None,
             token_ids: vec![10, 11],
             block_size: 2,
             medium: medium.map(str::to_owned),
@@ -1498,6 +1550,8 @@ fn test_storage_placeholder_store_is_indexed_as_disk_noop() {
     let raw = RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(301)],
         parent_block_hash: None,
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![],
         block_size: 0,
         medium: Some("STORAGE".to_string()),
@@ -1543,6 +1597,8 @@ fn namespaced_block_stored(
     RawKvEvent::BlockStored {
         block_hashes: vec![BlockHashValue::Unsigned(block_hash)],
         parent_block_hash: parent_block_hash.map(BlockHashValue::Unsigned),
+        parent_sequence_hash: None,
+        parent_sequence_hash_algorithm: None,
         token_ids: vec![10, 11],
         block_size: 2,
         medium: Some(medium.to_string()),
