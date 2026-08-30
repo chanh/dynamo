@@ -63,8 +63,9 @@ impl EvidenceMutationError {
 #[derive(Debug)]
 struct EvidenceHashResolver {
     // The listener lifetime binds the source incarnation. DP ranks may share
-    // one source, so the owner remains part of the identity fence.
-    mappings: HashMap<(CacheOwner, u64), EvidenceHashMapping>,
+    // one source, so the owner remains part of the identity fence. External
+    // block hashes are scoped to a cache group and may repeat across groups.
+    mappings: HashMap<(CacheOwner, u32, u64), EvidenceHashMapping>,
     capacity: usize,
 }
 
@@ -82,18 +83,19 @@ impl EvidenceHashResolver {
 
     fn clear_owner(&mut self, owner: CacheOwner) {
         self.mappings
-            .retain(|(mapped_owner, _), _| *mapped_owner != owner);
+            .retain(|(mapped_owner, _, _), _| *mapped_owner != owner);
     }
 
     fn learn_gpu(
         &mut self,
         owner: CacheOwner,
+        group: u32,
         blocks: &[CacheEvidenceStoredBlock],
     ) -> Result<(), EvidenceMutationError> {
         let mut pending = HashMap::with_capacity(blocks.len());
         let mut ambiguous = HashSet::new();
         for &block in blocks {
-            let key = (owner, block.external_hash);
+            let key = (owner, group, block.external_hash);
             if let Some(previous) = pending.insert(key, block)
                 && previous != block
             {
@@ -148,12 +150,13 @@ impl EvidenceHashResolver {
     fn resolve_cpu(
         &self,
         owner: CacheOwner,
+        group: u32,
         external_hashes: &[u64],
     ) -> Result<Vec<CacheEvidenceStoredBlock>, EvidenceMutationError> {
         external_hashes
             .iter()
             .map(
-                |&external_hash| match self.mappings.get(&(owner, external_hash)) {
+                |&external_hash| match self.mappings.get(&(owner, group, external_hash)) {
                     Some(EvidenceHashMapping::Known(block)) => Ok(*block),
                     Some(EvidenceHashMapping::Ambiguous) => {
                         Err(EvidenceMutationError::AmbiguousHash)
@@ -573,7 +576,8 @@ fn cache_evidence_mutation_with_resolver(
             let store_tier = tier(medium.as_deref())?;
             let stored = if store_tier == CacheTier::Cpu && token_ids.is_empty() && *block_size == 0
             {
-                resolver.resolve_cpu(owner, &external_hashes)?
+                let group = group_idx.ok_or(EvidenceMutationError::Invalid)?;
+                resolver.resolve_cpu(owner, group, &external_hashes)?
             } else {
                 let num_block_tokens = vec![*block_size as u64; external_hashes.len()];
                 let stored = create_stored_blocks(
@@ -600,8 +604,10 @@ fn cache_evidence_mutation_with_resolver(
                         tokens_hash: block.tokens_hash.0,
                     })
                     .collect();
-                if store_tier == CacheTier::Gpu {
-                    resolver.learn_gpu(owner, &stored)?;
+                if store_tier == CacheTier::Gpu
+                    && let Some(group) = group_idx
+                {
+                    resolver.learn_gpu(owner, *group, &stored)?;
                 }
                 stored
             };
@@ -791,6 +797,35 @@ mod tests {
             ),
             Err(EvidenceMutationError::UnresolvedHash)
         );
+    }
+
+    #[test]
+    fn hash_only_cpu_store_resolves_external_hashes_per_cache_group() {
+        let group_zero_gpu = resolver_store("GPU", 0, 41, vec![1; 16], 16);
+        let group_one_gpu = resolver_store("GPU", 1, 41, vec![2; 16], 16);
+        let group_zero_cpu = resolver_store("CPU", 0, 41, vec![], 0);
+        let group_one_cpu = resolver_store("CPU", 1, 41, vec![], 0);
+        let mut resolver = EvidenceHashResolver::new(8);
+
+        let group_zero = resolve_with(&mut resolver, &group_zero_gpu)
+            .unwrap()
+            .unwrap();
+        let group_one = resolve_with(&mut resolver, &group_one_gpu)
+            .unwrap()
+            .unwrap();
+        let group_zero_cpu = resolve_with(&mut resolver, &group_zero_cpu)
+            .unwrap()
+            .unwrap();
+        let group_one_cpu = resolve_with(&mut resolver, &group_one_cpu)
+            .unwrap()
+            .unwrap();
+
+        let blocks = |mutation: CacheEvidenceMutation| match mutation {
+            CacheEvidenceMutation::Store { blocks, .. } => blocks,
+            _ => panic!("resolver store must remain a store mutation"),
+        };
+        assert_eq!(blocks(group_zero_cpu), blocks(group_zero));
+        assert_eq!(blocks(group_one_cpu), blocks(group_one));
     }
 
     #[test]
