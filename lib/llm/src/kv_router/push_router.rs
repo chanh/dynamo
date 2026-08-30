@@ -78,7 +78,7 @@ fn monitor_response_stream<Sel>(
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
-    let mut guard = CancelledStreamGuard::new(guard, Arc::clone(&context));
+    let mut guard = CancelledStreamGuard::new(guard);
     async_stream::stream! {
         // Keep one cancellation future alive for the whole response stream. Calling
         // `stopped()` for every item repeatedly clones and polls a watch receiver.
@@ -127,18 +127,14 @@ where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
     guard: Option<RequestGuard<Sel>>,
-    context: Arc<dyn AsyncEngineContext>,
 }
 
 impl<Sel> CancelledStreamGuard<Sel>
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
-    fn new(guard: RequestGuard<Sel>, context: Arc<dyn AsyncEngineContext>) -> Self {
-        Self {
-            guard: Some(guard),
-            context,
-        }
+    fn new(guard: RequestGuard<Sel>) -> Self {
+        Self { guard: Some(guard) }
     }
 }
 
@@ -171,21 +167,24 @@ where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
     fn drop(&mut self) {
-        if !self.context.is_stopped() {
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
+        // HTTP can drop the response body before propagating its context stop.
+        // A normal terminal path transitions the lifecycle before this wrapper drops.
         let Some(mut guard) = self.guard.take() else {
             return;
         };
         if !guard.begin_cancelled_drop_abort() {
             return;
         }
-        runtime.spawn(async move {
-            guard.abort().await;
-        });
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    guard.abort().await;
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Unable to finish cancelled request cleanup asynchronously");
+            }
+        }
     }
 }
 
@@ -1018,8 +1017,9 @@ mod tests {
             .await
             .expect("first response must be yielded");
         assert_eq!(item.data.unwrap().token_ids, vec![4, 5]);
-        cancelled_request.context().stop();
+        assert!(!cancelled_request.context().is_stopped());
         drop(monitored);
+        cancelled_request.context().stop();
 
         // This fixture has a live terminal registry but no worker publisher, so
         // the cancellation join follows the production missing-outcome timeout.
