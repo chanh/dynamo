@@ -3514,7 +3514,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             if exhausted:
                 self._finish_prompt_source_request(request_id)
             else:
-                self._mark_prompt_source_cancelled(request_id)
+                # Ingress can drop this generator before its later context-stop
+                # notification wakes _monitor_abort. Reuse the guarded abort path
+                # now so EngineCore emits the terminal prompt-source outcome.
+                await self.abort_request({"request_id": request_id})
 
     async def _assemble_custom_encoder_prompt(
         self,

@@ -2177,6 +2177,8 @@ def _prompt_source_decode_handler(monkeypatch) -> mod.DecodeWorkerHandler:
     handler._prompt_source_publisher = MagicMock()
     handler._prompt_source_active_origins = mod.OrderedDict()
     handler._prompt_source_pending_origins = mod.OrderedDict()
+    handler.engine_client = MagicMock()
+    handler.engine_client.abort = AsyncMock()
     handler._multimodal_request_processor.validate_multimodal_request = MagicMock()
     monkeypatch.setattr(mod, "_translate_vllm_client_errors", _passthrough)
     return handler
@@ -2199,6 +2201,7 @@ async def test_dropped_decode_generator_keeps_origin_until_terminal_outcome(
     await generator.aclose()
     assert "request-1" not in handler._prompt_source_active_origins
     assert "request-1" in handler._prompt_source_pending_origins
+    handler.engine_client.abort.assert_awaited_once_with("request-1")
 
     handler._publish_prompt_source_outcome(
         SimpleNamespace(
@@ -2232,6 +2235,7 @@ async def test_exhausted_decode_generator_removes_active_origin(monkeypatch):
     ] == [{"token_ids": [4, 5]}]
     assert not handler._prompt_source_active_origins
     assert not handler._prompt_source_pending_origins
+    handler.engine_client.abort.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
