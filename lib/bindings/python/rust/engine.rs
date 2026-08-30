@@ -53,9 +53,183 @@ fn detect_has_context(generator: &PyObject) -> bool {
     })
 }
 
+type RawPyItemStream = Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send>>;
+
 /// Boxed Rust stream of items yielded by a Python async generator. Each
 /// item is either a `PyObject` frame or the `PyErr` the generator raised.
-pub(crate) type PyItemStream = Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send>>;
+pub(crate) type PyItemStream = RawPyItemStream;
+
+struct CloseOnDropStream {
+    inner: RawPyItemStream,
+    close: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Stream for CloseOnDropStream {
+    type Item = PyResult<Py<PyAny>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(&poll, Poll::Ready(None)) {
+            self.close.take();
+        }
+        poll
+    }
+}
+
+impl Drop for CloseOnDropStream {
+    fn drop(&mut self) {
+        if let Some(close) = self.close.take() {
+            close();
+        }
+    }
+}
+
+fn schedule_python_generator_close(aclose: Py<PyAny>, locals: TaskLocals) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("Unable to close dropped Python response generator outside Tokio runtime");
+        return;
+    };
+    runtime.spawn(async move {
+        let close = tokio::task::spawn_blocking(move || {
+            Python::with_gil(|py| {
+                pyo3_async_runtimes::into_future_with_locals(&locals, aclose.bind(py).call0()?)
+            })
+        })
+        .await;
+        match close {
+            Ok(Ok(close)) => {
+                if let Err(error) = close.await {
+                    tracing::warn!(%error, "Failed to close dropped Python response generator");
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "Failed to start Python response generator close");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Python response generator close task failed");
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod close_on_drop_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc as std_mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn dropped_python_item_stream_runs_close_action() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_flag = closed.clone();
+        let stream = CloseOnDropStream {
+            inner: Box::pin(futures::stream::pending()),
+            close: Some(Box::new(move || {
+                close_flag.store(true, Ordering::SeqCst);
+            })),
+        };
+
+        drop(stream);
+
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn exhausted_python_item_stream_disarms_close_action() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_flag = closed.clone();
+        let mut stream = CloseOnDropStream {
+            inner: Box::pin(futures::stream::empty()),
+            close: Some(Box::new(move || {
+                close_flag.store(true, Ordering::SeqCst);
+            })),
+        };
+
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        assert!(!closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn dropping_after_ready_item_closes_python_generator() -> PyResult<()> {
+        pyo3::prepare_freethreaded_python();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let loop_thread = thread::spawn(move || -> PyResult<()> {
+            Python::with_gil(|py| {
+                let asyncio = py.import("asyncio")?;
+                let event_loop = asyncio.call_method0("new_event_loop")?;
+                asyncio.call_method1("set_event_loop", (&event_loop,))?;
+                let module = PyModule::from_code(
+                    py,
+                    &CString::new(
+                        r#"
+closed = False
+
+async def generate():
+    global closed
+    try:
+        yield 1
+        yield 2
+    finally:
+        closed = True
+"#,
+                    )
+                    .unwrap(),
+                    &CString::new("close_on_drop_test.py").unwrap(),
+                    &CString::new("close_on_drop_test").unwrap(),
+                )?;
+                let generator = module.getattr("generate")?.call0()?;
+                ready_tx
+                    .send((
+                        event_loop.clone().unbind(),
+                        generator.unbind(),
+                        module.unbind(),
+                    ))
+                    .expect("test receiver must remain open");
+                event_loop.call_method0("run_forever")?;
+                event_loop.call_method0("close")?;
+                Ok(())
+            })
+        });
+        let (event_loop, generator, module) = ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Python event loop must start");
+        let locals = Python::with_gil(|py| TaskLocals::new(event_loop.bind(py).clone()));
+        let mut stream = Python::with_gil(|py| {
+            demand_driven_python_stream(locals, generator.bind(py).clone())
+        })?;
+
+        let first = stream.next().await.expect("first item must be ready")?;
+        assert_eq!(Python::with_gil(|py| first.bind(py).extract::<u64>())?, 1);
+        drop(stream);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let closed = loop {
+            let closed = Python::with_gil(|py| module.bind(py).getattr("closed")?.extract::<bool>())?;
+            if closed {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        Python::with_gil(|py| {
+            event_loop.bind(py).call_method1(
+                "call_soon_threadsafe",
+                (event_loop.bind(py).getattr("stop")?,),
+            )?;
+            Ok::<_, PyErr>(())
+        })?;
+        loop_thread.join().expect("Python event loop thread panicked")?;
+        assert!(closed, "generator finally did not run");
+        Ok(())
+    }
+}
 
 /// Invoke the Python `generate` callable and convert the async generator it
 /// returns into a Rust [`Stream`] of `PyObject` items.
@@ -117,6 +291,8 @@ fn demand_driven_python_stream(
     generator: Bound<'_, PyAny>,
 ) -> PyResult<PyItemStream> {
     let anext = generator.getattr("__anext__")?.unbind();
+    let aclose = generator.getattr("aclose")?.unbind();
+    let close_locals = locals.clone_ref(generator.py());
     let stream = futures::stream::unfold((anext, locals), |(anext, locals)| async move {
         let next = Python::with_gil(|py| {
             pyo3_async_runtimes::into_future_with_locals(&locals, anext.bind(py).call0()?)
@@ -135,7 +311,12 @@ fn demand_driven_python_stream(
             Some((item, (anext, locals)))
         }
     });
-    Ok(Box::pin(stream))
+    Ok(Box::pin(CloseOnDropStream {
+        inner: Box::pin(stream),
+        close: Some(Box::new(move || {
+            schedule_python_generator_close(aclose, close_locals)
+        })),
+    }))
 }
 
 /// Rust/Python bridge that maps to the [`AsyncEngine`] trait
