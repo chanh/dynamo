@@ -76,6 +76,7 @@ pub(crate) struct CacheEvidenceMetrics {
     batches_total: IntCounterVec,
     mutations_total: IntCounterVec,
     apply_integrity_failures_total: IntCounterVec,
+    mapping_conflicts_total: IntCounterVec,
     source_gaps_total: IntCounter,
     physical_blocks: IntGaugeVec,
     history_blocks: IntGauge,
@@ -128,6 +129,14 @@ impl CacheEvidenceMetrics {
                         labels,
                     )
                     .expect("cache evidence apply integrity failure metrics");
+                let mapping_conflicts_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_evidence_mapping_conflicts_total"),
+                        "Conflicting cache mappings by bounded conflict stage",
+                        &["reason"],
+                        labels,
+                    )
+                    .expect("cache evidence mapping conflict metrics");
                 let source_gaps_total = metrics
                     .create_intcounter(
                         &router_metric("cache_loss_evidence_source_gaps_total"),
@@ -278,6 +287,20 @@ impl CacheEvidenceMetrics {
                 ] {
                     apply_integrity_failures_total.with_label_values(&[reason]);
                 }
+                for reason in [
+                    "batch_parent_attestation",
+                    "ledger_parent_attestation",
+                    "ambiguous_parent",
+                    "dependent_parent",
+                    "dependent_attestation",
+                    "existing_normal_mapping",
+                    "existing_lookahead_mapping",
+                    "cross_tier_normal_mapping",
+                    "cross_tier_lookahead_mapping",
+                    "lookahead_parent",
+                ] {
+                    mapping_conflicts_total.with_label_values(&[reason]);
+                }
                 for tier in ["gpu", "cpu"] {
                     physical_blocks.with_label_values(&[tier]);
                 }
@@ -285,6 +308,7 @@ impl CacheEvidenceMetrics {
                     batches_total,
                     mutations_total,
                     apply_integrity_failures_total,
+                    mapping_conflicts_total,
                     source_gaps_total,
                     physical_blocks,
                     history_blocks,
@@ -323,6 +347,12 @@ impl CacheEvidenceMetrics {
 
     pub(crate) fn observe_apply_integrity_failure(&self, reason: &'static str) {
         self.apply_integrity_failures_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    pub(crate) fn observe_mapping_conflict(&self, reason: &'static str) {
+        self.mapping_conflicts_total
             .with_label_values(&[reason])
             .inc();
     }

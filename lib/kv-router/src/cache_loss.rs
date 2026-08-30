@@ -41,6 +41,37 @@ pub enum CacheEvidenceApplyIntegrityFailure {
     MappingCapacity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CacheEvidenceMappingConflict {
+    BatchParentAttestation,
+    LedgerParentAttestation,
+    AmbiguousParent,
+    DependentParent,
+    DependentAttestation,
+    ExistingNormalMapping,
+    ExistingLookaheadMapping,
+    CrossTierNormalMapping,
+    CrossTierLookaheadMapping,
+    LookaheadParent,
+}
+
+impl CacheEvidenceMappingConflict {
+    pub const fn metric_label(self) -> &'static str {
+        match self {
+            Self::BatchParentAttestation => "batch_parent_attestation",
+            Self::LedgerParentAttestation => "ledger_parent_attestation",
+            Self::AmbiguousParent => "ambiguous_parent",
+            Self::DependentParent => "dependent_parent",
+            Self::DependentAttestation => "dependent_attestation",
+            Self::ExistingNormalMapping => "existing_normal_mapping",
+            Self::ExistingLookaheadMapping => "existing_lookahead_mapping",
+            Self::CrossTierNormalMapping => "cross_tier_normal_mapping",
+            Self::CrossTierLookaheadMapping => "cross_tier_lookahead_mapping",
+            Self::LookaheadParent => "lookahead_parent",
+        }
+    }
+}
+
 impl CacheEvidenceApplyIntegrityFailure {
     pub const fn metric_label(self) -> &'static str {
         match self {
@@ -56,6 +87,7 @@ impl CacheEvidenceApplyIntegrityFailure {
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct CacheEvidenceApplyResult {
     failures: HashSet<CacheEvidenceApplyIntegrityFailure>,
+    mapping_conflicts: HashSet<CacheEvidenceMappingConflict>,
 }
 
 impl CacheEvidenceApplyResult {
@@ -65,6 +97,10 @@ impl CacheEvidenceApplyResult {
 
     pub fn failures(&self) -> impl Iterator<Item = CacheEvidenceApplyIntegrityFailure> + '_ {
         self.failures.iter().copied()
+    }
+
+    pub fn mapping_conflicts(&self) -> impl Iterator<Item = CacheEvidenceMappingConflict> + '_ {
+        self.mapping_conflicts.iter().copied()
     }
 }
 
@@ -243,7 +279,7 @@ enum StoreMutationResult {
     Applied,
     MissingParent,
     Invalid,
-    RejectedMapping,
+    RejectedMapping(CacheEvidenceMappingConflict),
     Capacity,
 }
 
@@ -645,13 +681,23 @@ impl CacheEvidenceLedger {
                     .insert((group, external), sequence)
                     .is_some_and(|known| known != sequence)
                 {
-                    return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                    return self.reject_store_run(
+                        result,
+                        StoreMutationResult::RejectedMapping(
+                            CacheEvidenceMappingConflict::BatchParentAttestation,
+                        ),
+                    );
                 }
                 match self.lookup_parent_sequence_hash(owner, group, external) {
                     ParentSequenceLookup::Missing => {}
                     ParentSequenceLookup::Resolved(known) if known == sequence => {}
                     ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
-                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                        return self.reject_store_run(
+                            result,
+                            StoreMutationResult::RejectedMapping(
+                                CacheEvidenceMappingConflict::LedgerParentAttestation,
+                            ),
+                        );
                     }
                 }
                 ready.push_back(index);
@@ -662,7 +708,12 @@ impl CacheEvidenceLedger {
                         waiting.entry((group, external)).or_default().push(index);
                     }
                     ParentSequenceLookup::Ambiguous => {
-                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                        return self.reject_store_run(
+                            result,
+                            StoreMutationResult::RejectedMapping(
+                                CacheEvidenceMappingConflict::AmbiguousParent,
+                            ),
+                        );
                     }
                 }
             } else {
@@ -716,13 +767,23 @@ impl CacheEvidenceLedger {
                     let ParentSequenceLookup::Resolved(sequence) =
                         self.lookup_planned_parent(owner, group, block.external_hash, &mut planned)
                     else {
-                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                        return self.reject_store_run(
+                            result,
+                            StoreMutationResult::RejectedMapping(
+                                CacheEvidenceMappingConflict::DependentParent,
+                            ),
+                        );
                     };
                     if constraints
                         .get(&(group, block.external_hash))
                         .is_some_and(|attested| *attested != sequence)
                     {
-                        return self.reject_store_run(result, StoreMutationResult::RejectedMapping);
+                        return self.reject_store_run(
+                            result,
+                            StoreMutationResult::RejectedMapping(
+                                CacheEvidenceMappingConflict::DependentAttestation,
+                            ),
+                        );
                     }
                     if let Some(dependents) = waiting.remove(&(group, block.external_hash)) {
                         ready.extend(dependents);
@@ -783,7 +844,8 @@ impl CacheEvidenceLedger {
             StoreMutationResult::MissingParent => CacheEvidenceApplyIntegrityFailure::MissingParent,
             StoreMutationResult::Invalid => CacheEvidenceApplyIntegrityFailure::MissingGroup,
             StoreMutationResult::Capacity => CacheEvidenceApplyIntegrityFailure::MappingCapacity,
-            StoreMutationResult::RejectedMapping => {
+            StoreMutationResult::RejectedMapping(conflict) => {
+                result.mapping_conflicts.insert(conflict);
                 CacheEvidenceApplyIntegrityFailure::ConflictingMapping
             }
             StoreMutationResult::Applied => unreachable!(),
@@ -835,7 +897,11 @@ impl CacheEvidenceLedger {
         let mut enriched = false;
         if let Some(normal) = normal {
             match entry.normal_sequence_hash {
-                Some(known) if known != normal => return StoreMutationResult::RejectedMapping,
+                Some(known) if known != normal => {
+                    return StoreMutationResult::RejectedMapping(
+                        CacheEvidenceMappingConflict::ExistingNormalMapping,
+                    );
+                }
                 Some(_) => {}
                 None => {
                     entry.normal_sequence_hash = Some(normal);
@@ -845,7 +911,11 @@ impl CacheEvidenceLedger {
         }
         if let Some(lookahead) = lookahead {
             match entry.eagle_lookahead {
-                Some(known) if known != lookahead => return StoreMutationResult::RejectedMapping,
+                Some(known) if known != lookahead => {
+                    return StoreMutationResult::RejectedMapping(
+                        CacheEvidenceMappingConflict::ExistingLookaheadMapping,
+                    );
+                }
                 Some(_) => {}
                 None => {
                     entry.eagle_lookahead = Some(lookahead);
@@ -901,11 +971,15 @@ impl CacheEvidenceLedger {
                     .normal_sequence_hash
                     .is_some_and(|known| known != sequence_hash)
                 {
-                    return StoreMutationResult::RejectedMapping;
+                    return StoreMutationResult::RejectedMapping(
+                        CacheEvidenceMappingConflict::CrossTierNormalMapping,
+                    );
                 }
                 if let Some(candidate) = source_entry.eagle_lookahead {
                     if lookahead.is_some_and(|known| known != candidate) {
-                        return StoreMutationResult::RejectedMapping;
+                        return StoreMutationResult::RejectedMapping(
+                            CacheEvidenceMappingConflict::CrossTierLookaheadMapping,
+                        );
                     }
                     lookahead = Some(candidate);
                 }
@@ -939,7 +1013,9 @@ impl CacheEvidenceLedger {
                 ParentSequenceLookup::Missing => {}
                 ParentSequenceLookup::Resolved(known) if known == sequence_hash => {}
                 ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
-                    return StoreMutationResult::RejectedMapping;
+                    return StoreMutationResult::RejectedMapping(
+                        CacheEvidenceMappingConflict::LookaheadParent,
+                    );
                 }
             }
         }
@@ -958,7 +1034,9 @@ impl CacheEvidenceLedger {
                 .eagle_lookahead
                 .is_some_and(|known| known != lookahead)
             {
-                return StoreMutationResult::RejectedMapping;
+                return StoreMutationResult::RejectedMapping(
+                    CacheEvidenceMappingConflict::ExistingLookaheadMapping,
+                );
             }
         }
         self.merge_planned_entry(
@@ -984,7 +1062,9 @@ impl CacheEvidenceLedger {
                 match self.lookup_planned_parent(owner, group, external, planned) {
                     ParentSequenceLookup::Resolved(hash) => Ok(Some(hash)),
                     ParentSequenceLookup::Missing => Err(StoreMutationResult::MissingParent),
-                    ParentSequenceLookup::Ambiguous => Err(StoreMutationResult::RejectedMapping),
+                    ParentSequenceLookup::Ambiguous => Err(StoreMutationResult::RejectedMapping(
+                        CacheEvidenceMappingConflict::AmbiguousParent,
+                    )),
                 }
             }
             (Some(external), Some(attested)) => match self
@@ -993,7 +1073,9 @@ impl CacheEvidenceLedger {
                 ParentSequenceLookup::Missing => Ok(Some(attested)),
                 ParentSequenceLookup::Resolved(known) if known == attested => Ok(Some(attested)),
                 ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
-                    Err(StoreMutationResult::RejectedMapping)
+                    Err(StoreMutationResult::RejectedMapping(
+                        CacheEvidenceMappingConflict::LedgerParentAttestation,
+                    ))
                 }
             },
         }
@@ -1043,7 +1125,9 @@ impl CacheEvidenceLedger {
                     ParentSequenceLookup::Missing => {}
                     ParentSequenceLookup::Resolved(known) if known == attested => {}
                     ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
-                        return Err(StoreMutationResult::RejectedMapping);
+                        return Err(StoreMutationResult::RejectedMapping(
+                            CacheEvidenceMappingConflict::LedgerParentAttestation,
+                        ));
                     }
                 }
                 Ok(Some(attested))
@@ -2238,6 +2322,10 @@ mod tests {
             conflict.failures().collect::<HashSet<_>>(),
             HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
         );
+        assert_eq!(
+            conflict.mapping_conflicts().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceMappingConflict::ExistingLookaheadMapping])
+        );
         assert_eq!(ledger.physical_external_entries, before);
         assert_physical_counter_oracle(&ledger);
 
@@ -2857,6 +2945,10 @@ mod tests {
             result.failures().collect::<HashSet<_>>(),
             HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
         );
+        assert_eq!(
+            result.mapping_conflicts().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceMappingConflict::LedgerParentAttestation])
+        );
         assert_eq!(ledger.stats().cpu_physical_blocks, cpu_blocks_before);
         assert!(
             !ledger
@@ -3269,6 +3361,10 @@ mod tests {
         assert_eq!(
             result.failures().collect::<HashSet<_>>(),
             HashSet::from([CacheEvidenceApplyIntegrityFailure::ConflictingMapping])
+        );
+        assert_eq!(
+            result.mapping_conflicts().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceMappingConflict::CrossTierNormalMapping])
         );
         assert!(!ledger.stats().physical_telemetry_complete);
         assert_eq!(ledger.stats().cpu_physical_blocks, 1);

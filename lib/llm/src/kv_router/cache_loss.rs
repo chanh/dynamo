@@ -2611,6 +2611,9 @@ async fn run_cache_evidence_subscriber(
                         for failure in apply_result.failures() {
                             metrics.observe_apply_integrity_failure(failure.metric_label());
                         }
+                        for conflict in apply_result.mapping_conflicts() {
+                            metrics.observe_mapping_conflict(conflict.metric_label());
+                        }
                         if barrier_state
                             .fail_owner(batch.owner, "barrier_apply_integrity_failure")
                             > 0
