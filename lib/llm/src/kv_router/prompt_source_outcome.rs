@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,6 @@ use crate::protocols::common::timing::CacheSourceObservation;
 const TOPIC: &str = "prompt-source-terminal-v1";
 const QUEUE_CAPACITY: usize = 4096;
 const REGISTRY_CAPACITY: usize = 100_000;
-const REGISTRY_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalPromptSourceOutcome {
@@ -101,7 +100,6 @@ impl TerminalPromptSourcePublisher {
 
 struct PendingOutcome {
     generation: u64,
-    inserted_at: Instant,
     tx: oneshot::Sender<TerminalPromptSourceOutcome>,
 }
 
@@ -118,7 +116,6 @@ pub struct TerminalPromptSourceRegistry {
 struct TerminalPromptSourceRegistryInner {
     router_id: u64,
     capacity: usize,
-    ttl: Duration,
     state: Mutex<RegistryState>,
     events_total: prometheus::IntCounterVec,
 }
@@ -155,7 +152,6 @@ impl TerminalPromptSourceRegistry {
             inner: Arc::new(TerminalPromptSourceRegistryInner {
                 router_id,
                 capacity: REGISTRY_CAPACITY,
-                ttl: REGISTRY_TTL,
                 state: Mutex::new(RegistryState {
                     next_generation: 0,
                     pending: HashMap::new(),
@@ -191,10 +187,10 @@ impl TerminalPromptSourceRegistry {
     ) -> Result<TerminalPromptSourceRegistration, RegistrationError> {
         let (tx, rx) = oneshot::channel();
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
-        state
-            .pending
-            .retain(|_, pending| now.duration_since(pending.inserted_at) < self.inner.ttl);
+        // A request may legitimately run for longer than any fixed registry TTL.
+        // The registration drop path removes live entries generation-safely; only
+        // discard entries whose receiver is already gone.
+        state.pending.retain(|_, pending| !pending.tx.is_closed());
         if state.pending.contains_key(&request_id) {
             drop(state);
             self.observe("registry_duplicate");
@@ -207,14 +203,9 @@ impl TerminalPromptSourceRegistry {
         }
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
         let generation = state.next_generation;
-        state.pending.insert(
-            request_id.clone(),
-            PendingOutcome {
-                generation,
-                inserted_at: now,
-                tx,
-            },
-        );
+        state
+            .pending
+            .insert(request_id.clone(), PendingOutcome { generation, tx });
         Ok(TerminalPromptSourceRegistration {
             registry: self.clone(),
             request_id,
@@ -302,7 +293,6 @@ mod tests {
             inner: Arc::new(TerminalPromptSourceRegistryInner {
                 router_id,
                 capacity,
-                ttl: Duration::from_secs(30),
                 state: Mutex::new(RegistryState {
                     next_generation: 0,
                     pending: HashMap::new(),
@@ -471,6 +461,19 @@ mod tests {
         );
         registry.deliver(outcome(7, "same"));
         assert!(first.wait(Duration::from_millis(10)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_registration_does_not_prune_a_live_request() {
+        let registry = registry(7, 2);
+        let first = registry.register("long-running".to_string()).unwrap();
+
+        let second = registry.register("concurrent".to_string()).unwrap();
+        registry.deliver(outcome(7, "long-running"));
+
+        assert!(first.wait(Duration::from_millis(10)).await.is_ok());
+        drop(second);
+        assert!(registry.inner.state.lock().unwrap().pending.is_empty());
     }
 
     #[test]

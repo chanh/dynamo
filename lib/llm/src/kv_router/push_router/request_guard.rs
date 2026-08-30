@@ -782,7 +782,7 @@ where
         );
     }
 
-    async fn await_terminal_cache_source(&mut self) {
+    async fn await_terminal_cache_source(&mut self, terminal_kind: CacheLossTerminalKind) {
         if self.cache_loss_recorded || !self.observability.dispatched() {
             return;
         }
@@ -792,7 +792,7 @@ where
                 RegistrationError::Duplicate => "terminal_registry_duplicate",
                 RegistrationError::Unavailable => "terminal_registry_unavailable",
             };
-            self.record_terminal_incomplete(result);
+            self.record_terminal_incomplete(result, terminal_kind);
             return;
         }
         let Some(registration) = self.terminal_prompt_source.take() else {
@@ -803,24 +803,29 @@ where
                 if let Some(route) = self.cache_loss_route.as_mut() {
                     route.finalize_barrier().await;
                 }
-                self.finalize_aborted_cache_history(
-                    outcome.num_computed_output_tokens,
-                    outcome.num_unobserved_computed_output_tokens,
-                    outcome.cache_source.complete,
-                );
-                self.observe_cache_loss_source(
-                    outcome.cache_source,
-                    CacheLossTerminalKind::Cancelled,
-                );
+                if terminal_kind == CacheLossTerminalKind::Cancelled {
+                    self.finalize_aborted_cache_history(
+                        outcome.num_computed_output_tokens,
+                        outcome.num_unobserved_computed_output_tokens,
+                        outcome.cache_source.complete,
+                    );
+                }
+                self.observe_cache_loss_source(outcome.cache_source, terminal_kind);
             }
-            Err(WaitError::Timeout) => self.record_terminal_incomplete("terminal_timeout"),
+            Err(WaitError::Timeout) => {
+                self.record_terminal_incomplete("terminal_timeout", terminal_kind)
+            }
             Err(WaitError::PublisherClosed) => {
-                self.record_terminal_incomplete("terminal_publisher_closed")
+                self.record_terminal_incomplete("terminal_publisher_closed", terminal_kind)
             }
         }
     }
 
-    fn record_terminal_incomplete(&mut self, result: &'static str) {
+    fn record_terminal_incomplete(
+        &mut self,
+        result: &'static str,
+        terminal_kind: CacheLossTerminalKind,
+    ) {
         if self.cache_loss_recorded || !self.observability.dispatched() {
             return;
         }
@@ -836,7 +841,7 @@ where
         funnel.observe_incomplete(route.prompt_tokens);
         self.observability.request_metrics().observe_cache_loss(
             &funnel,
-            CacheLossTerminalKind::Cancelled,
+            terminal_kind,
             "incomplete",
             result,
         );
@@ -845,6 +850,9 @@ where
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
         self.finalize_cache_loss_route().await;
+        self.observe_cache_loss_if_ready(CacheLossTerminalKind::Completed);
+        self.await_terminal_cache_source(CacheLossTerminalKind::Completed)
+            .await;
         self.finalize_cache_loss(CacheLossTerminalKind::Completed);
         self.finalize_cache_history();
         self.terminal_lifecycle = RequestTerminalLifecycle::Finished;
@@ -855,7 +863,8 @@ where
     pub(super) async fn abort(&mut self) {
         self.terminal_lifecycle = RequestTerminalLifecycle::Aborting;
         self.cleanup.finish().await;
-        self.await_terminal_cache_source().await;
+        self.await_terminal_cache_source(CacheLossTerminalKind::Cancelled)
+            .await;
         self.finalize_cache_loss(CacheLossTerminalKind::Cancelled);
         self.finalize_cache_history();
         self.terminal_lifecycle = RequestTerminalLifecycle::Aborted;
@@ -870,7 +879,10 @@ where
         // RequestCleanup drops immediately afterward and performs resource cleanup.
         match self.terminal_lifecycle {
             RequestTerminalLifecycle::Aborting => {
-                self.record_terminal_incomplete("terminal_wait_cancelled");
+                self.record_terminal_incomplete(
+                    "terminal_wait_cancelled",
+                    CacheLossTerminalKind::Cancelled,
+                );
             }
             RequestTerminalLifecycle::Open => {
                 self.finalize_cache_loss(CacheLossTerminalKind::Dropped);
