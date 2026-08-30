@@ -14,14 +14,14 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import dynamo.vllm.handlers as mod
 import numpy as np
 import pytest
 import torch
-
-import dynamo.vllm.handlers as mod
 from dynamo.common.memory.multimodal_embedding_cache_manager import (
     MultimodalEmbeddingCacheManager,
 )
+from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.vllm.multimodal_utils.protocol import (
     PatchedTokensPrompt,
     vLLMMultimodalRequest,
@@ -2136,6 +2136,44 @@ def test_terminal_prompt_source_outcome_carries_origin_without_payload():
     assert "prompt" not in payload
     assert "request-1" not in handler._prompt_source_pending_origins
     publisher.publish.assert_called_once()
+    publisher.observe_control_result.assert_not_called()
+
+
+def test_vllm_error_preserves_terminal_retrieval_failure_attribution():
+    assert normalize_finish_reason("error") == (
+        "error: vLLM engine reported a request failure"
+    )
+
+    handler = mod.DecodeWorkerHandler.__new__(mod.DecodeWorkerHandler)
+    publisher = MagicMock()
+    handler._prompt_source_publisher = publisher
+    handler._prompt_source_active_origins = mod.OrderedDict(
+        [("request-1", (17, 23, mod.time.monotonic()))]
+    )
+    handler._prompt_source_pending_origins = mod.OrderedDict()
+
+    handler._publish_prompt_source_outcome(
+        SimpleNamespace(
+            request_id="request-1",
+            complete=True,
+            num_prompt_tokens=100,
+            num_local_cached_tokens=20,
+            num_external_cached_tokens=30,
+            num_external_lookup_tokens=35,
+            num_external_retrieval_failure_tokens=5,
+            num_computed_tokens=50,
+            incomplete_reason=None,
+            num_computed_output_tokens=0,
+            num_unobserved_computed_output_tokens=0,
+            generated_history_incomplete_reason=None,
+        )
+    )
+
+    payload = publisher.publish.call_args.args[0]
+    assert payload["origin_router_id"] == 17
+    assert payload["registration_nonce"] == 23
+    assert payload["cache_source"]["complete"] is True
+    assert payload["cache_source"]["retrieval_failure_tokens"] == 5
     publisher.observe_control_result.assert_not_called()
 
 

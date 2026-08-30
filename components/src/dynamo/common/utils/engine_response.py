@@ -18,4 +18,6 @@ def normalize_finish_reason(finish_reason: str) -> str:
     if finish_reason and finish_reason.startswith("abort"):
         logging.debug(f"Normalizing finish reason: {finish_reason} to cancelled")
         return "cancelled"
+    if finish_reason == "error":
+        return "error: vLLM engine reported a request failure"
     return finish_reason

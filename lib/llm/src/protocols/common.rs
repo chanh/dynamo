@@ -874,6 +874,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_engine_output_carries_vllm_failure_through_msgpack() {
+        use dynamo_runtime::protocols::maybe_error::MaybeError;
+
+        let chunk = serde_json::json!({
+            "token_ids": [],
+            "finish_reason": "error: vLLM engine reported a request failure",
+        });
+        let msgpack = rmp_serde::to_vec_named(&chunk).unwrap();
+        let output: llm_backend::LLMEngineOutput = rmp_serde::from_slice(&msgpack).unwrap();
+        let err = output.err().expect("error finish reason must surface");
+        assert!(
+            err.to_string()
+                .contains("vLLM engine reported a request failure")
+        );
+    }
+
     /// A bare `"error"` stays rejected on purpose. Producers emitting it are
     /// discarding a message they hold; accepting it here would paper over that
     /// with invented text instead of leaving the defect visible.
