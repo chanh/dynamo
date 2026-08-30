@@ -2003,8 +2003,11 @@ async fn run_cold_epoch_once(
             state.mark_history_incomplete();
             evidence_ready = false;
         }
+        metrics.update_state(state.stats());
     } else {
-        ledger.lock().mark_history_incomplete();
+        let mut state = ledger.lock();
+        state.mark_history_incomplete();
+        metrics.update_state(state.stats());
     }
 
     let release_client = if evidence_ready {
@@ -2039,7 +2042,9 @@ async fn run_cold_epoch_once(
         }
     };
     if !released {
-        ledger.lock().mark_history_incomplete();
+        let mut state = ledger.lock();
+        state.mark_history_incomplete();
+        metrics.update_state(state.stats());
         metrics.observe_cold_epoch("release");
     } else if evidence_ready {
         metrics.observe_cold_epoch("success");
@@ -3239,6 +3244,22 @@ mod tests {
             &mut ledger,
         ));
         assert!(ledger.stats().history_complete);
+    }
+
+    #[test]
+    fn cold_epoch_commit_exports_completed_empty_history_state() {
+        let owner = barrier_owner(7);
+        let owners = HashSet::from([owner]);
+        let mut ledger = CacheEvidenceLedger::new(8);
+        ledger.set_expected_owners(owners.iter().copied());
+        ledger.record_group_catalog(owner, CacheTier::Gpu, [0]);
+        ledger.record_group_catalog(owner, CacheTier::Cpu, [0]);
+        ledger.record_seen_blocks([11, 12]);
+
+        assert!(ledger.commit_cold_history_epoch(&owners).is_some());
+        let exported = ledger.stats();
+        assert!(exported.history_complete);
+        assert_eq!(exported.history_blocks, 0);
     }
 
     fn cold_epoch_control_instance(instance_id: u64) -> Instance {
