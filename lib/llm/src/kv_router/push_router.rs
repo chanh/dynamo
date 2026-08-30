@@ -833,6 +833,7 @@ mod tests {
     use super::*;
     use crate::{
         http::service::metrics::Metrics,
+        kv_router::cache_loss::CacheLossRouteObservation,
         local_model::runtime_config::ModelRuntimeConfig,
         migration::Migration,
         protocols::common::extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
@@ -960,6 +961,104 @@ mod tests {
             .track_selection(&retry_request, &mut retry_selection, false)
             .await
             .expect("same-worker booking must be released before yielding the error");
+        retry_guard.abort().await;
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_suspended_stream_aborts_and_preserves_observed_history() {
+        let (router, runtime) = router(None).await;
+        let context_id = "cancelled-suspended-stream".to_string();
+        let controller = Controller::new(context_id.clone());
+        let cancelled_request = Context::with_controller(request(), controller);
+        let (mut selection, _) = router
+            .select_with_affinity(&cancelled_request, RequestPhase::Aggregated, false)
+            .await
+            .unwrap();
+        let selected_worker = selection.worker;
+        let mut guard = router
+            .track_selection(&cancelled_request, &mut selection, false)
+            .await
+            .unwrap();
+        let mut route = CacheLossRouteObservation::default();
+        route.prompt_tokens = cancelled_request.token_ids.len() as u64;
+        guard.set_cache_loss_route(Some(route));
+        guard.mark_dispatched();
+
+        let metrics = Arc::clone(&router.request_metrics);
+        let cancelled_before = metrics
+            .cache_loss_observations_total
+            .with_label_values(&["cancelled", "incomplete", "terminal_timeout"])
+            .get();
+        let dropped_before = metrics
+            .cache_loss_observations_total
+            .with_label_values(&["dropped", "incomplete", "missing_join"])
+            .get();
+        let source = ResponseStream::new(
+            Box::pin(async_stream::stream! {
+                yield Annotated::from_data(LLMEngineOutput {
+                    token_ids: vec![4, 5],
+                    ..Default::default()
+                });
+                futures::future::pending::<()>().await;
+            }),
+            cancelled_request.context().clone(),
+        );
+        let mut monitored = Box::pin(monitor_response_stream(
+            source,
+            cancelled_request.context().clone(),
+            guard,
+        ));
+
+        let item = monitored
+            .next()
+            .await
+            .expect("first response must be yielded");
+        assert_eq!(item.data.unwrap().token_ids, vec![4, 5]);
+        cancelled_request.context().stop();
+        drop(monitored);
+
+        // This fixture has a live terminal registry but no worker publisher, so
+        // the cancellation join follows the production missing-outcome timeout.
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if metrics
+                    .cache_loss_observations_total
+                    .with_label_values(&["cancelled", "incomplete", "terminal_timeout"])
+                    .get()
+                    == cancelled_before + 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background cancellation abort must finish");
+
+        assert_eq!(
+            metrics
+                .cache_loss_observations_total
+                .with_label_values(&["dropped", "incomplete", "missing_join"])
+                .get(),
+            dropped_before,
+            "the suspended stream must be classified as cancelled, not dropped"
+        );
+
+        let retry_request =
+            Context::with_id_and_metadata(request(), context_id, Default::default());
+        let (mut retry_selection, _) = router
+            .select_with_affinity(&retry_request, RequestPhase::Aggregated, false)
+            .await
+            .unwrap();
+        assert_eq!(retry_selection.worker, selected_worker);
+        let mut retry_guard = router
+            .track_selection(&retry_request, &mut retry_selection, false)
+            .await
+            .expect("background abort must release the same-request booking");
         retry_guard.abort().await;
 
         drop(router);
