@@ -2107,7 +2107,8 @@ def test_terminal_prompt_source_outcome_carries_origin_without_payload():
         [("request-1", (17, 23, mod.time.monotonic()))]
     )
     outcome = SimpleNamespace(
-        request_id="request-1",
+        request_id="request-1-deadbeef",
+        external_request_id="request-1",
         complete=True,
         num_prompt_tokens=100,
         num_local_cached_tokens=20,
@@ -2134,6 +2135,8 @@ def test_terminal_prompt_source_outcome_carries_origin_without_payload():
     assert "token_ids" not in payload
     assert "prompt" not in payload
     assert "request-1" not in handler._prompt_source_pending_origins
+    publisher.publish.assert_called_once()
+    publisher.observe_control_result.assert_not_called()
 
 
 def test_terminal_prompt_source_origin_registry_is_bounded():

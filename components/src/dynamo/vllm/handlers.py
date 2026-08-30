@@ -1311,9 +1311,11 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         publisher = getattr(self, "_prompt_source_publisher", None)
         if publisher is None:
             return
-        origin = self._prompt_source_pending_origins.pop(outcome.request_id, None)
+        external_request_id = getattr(outcome, "external_request_id", None)
+        request_id = external_request_id or outcome.request_id
+        origin = self._prompt_source_pending_origins.pop(request_id, None)
         if origin is None:
-            origin = self._prompt_source_active_origins.pop(outcome.request_id, None)
+            origin = self._prompt_source_active_origins.pop(request_id, None)
         if origin is None:
             self._observe_prompt_source_control_result("origin_missing")
             return
@@ -1357,7 +1359,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         publisher.publish(
             {
                 "origin_router_id": origin_router_id,
-                "request_id": outcome.request_id,
+                "request_id": request_id,
                 "registration_nonce": registration_nonce,
                 "cache_source": cache_source,
                 "num_computed_output_tokens": int(outcome.num_computed_output_tokens),
