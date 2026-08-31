@@ -118,6 +118,10 @@ pub enum CacheEvidenceMutation {
         group_idx: u32,
         parent_external_hash: u64,
         parent_sequence_hash: u64,
+        /// EAGLE sequence identity includes the next-token context and is not
+        /// a stable mapping from the ordinary external parent hash.
+        #[serde(default)]
+        contextual_parent: bool,
         blocks: Vec<CacheEvidenceStoredBlock>,
     },
     StoreEagleLookahead {
@@ -162,6 +166,7 @@ impl CacheEvidenceMutation {
                 parent_external_hash,
                 parent_sequence_hash,
                 blocks,
+                ..
             } => Some((
                 *tier,
                 Some(*group_idx),
@@ -172,6 +177,16 @@ impl CacheEvidenceMutation {
             Self::Remove { .. } | Self::Clear { .. } => None,
             Self::StoreEagleLookahead { .. } => None,
         }
+    }
+
+    fn has_contextual_parent(&self) -> bool {
+        matches!(
+            self,
+            Self::StoreWithParentAttestation {
+                contextual_parent: true,
+                ..
+            } | Self::StoreEagleLookahead { .. }
+        )
     }
 }
 
@@ -575,11 +590,16 @@ impl CacheEvidenceLedger {
         if let Some((_, Some(group), parent_external, parent_sequence, blocks)) =
             mutation.store_parts()
         {
-            let mut parent =
-                match self.resolve_store_parent(owner, group, parent_external, parent_sequence) {
-                    Ok(parent) => parent,
-                    Err(_) => return HashSet::new(),
-                };
+            let mut parent = match self.resolve_store_parent(
+                owner,
+                group,
+                parent_external,
+                parent_sequence,
+                mutation.has_contextual_parent(),
+            ) {
+                Ok(parent) => parent,
+                Err(_) => return HashSet::new(),
+            };
             let mut affected = HashSet::new();
             for block in blocks {
                 let hash = parent.map_or(block.tokens_hash, |parent| {
@@ -677,6 +697,10 @@ impl CacheEvidenceLedger {
                 }
             };
             if let (Some(external), Some(sequence)) = (parent_external, attested) {
+                if mutation.has_contextual_parent() {
+                    ready.push_back(index);
+                    continue;
+                }
                 if constraints
                     .insert((group, external), sequence)
                     .is_some_and(|known| known != sequence)
@@ -752,6 +776,7 @@ impl CacheEvidenceLedger {
                         group,
                         parent_external,
                         parent_sequence,
+                        mutation.has_contextual_parent(),
                         blocks,
                         &mut planned,
                     )
@@ -939,6 +964,7 @@ impl CacheEvidenceLedger {
         group: u32,
         parent_external_hash: Option<u64>,
         attested_parent: Option<u64>,
+        contextual_parent: bool,
         blocks: &[CacheEvidenceStoredBlock],
         planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
     ) -> StoreMutationResult {
@@ -947,6 +973,7 @@ impl CacheEvidenceLedger {
             group,
             parent_external_hash,
             attested_parent,
+            contextual_parent,
             planned,
         ) {
             Ok(parent) => parent,
@@ -1003,22 +1030,13 @@ impl CacheEvidenceLedger {
         owner: CacheOwner,
         tier: CacheTier,
         group: u32,
-        parent_external_hash: Option<u64>,
+        // EAGLE sequence identity includes next-token context, so this ordinary
+        // external parent hash cannot be used as a stable mapping key.
+        _parent_external_hash: Option<u64>,
         sequence_hash: u64,
         block: CacheEvidenceStoredBlock,
         planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
     ) -> StoreMutationResult {
-        if let Some(parent_external_hash) = parent_external_hash {
-            match self.lookup_planned_parent(owner, group, parent_external_hash, planned) {
-                ParentSequenceLookup::Missing => {}
-                ParentSequenceLookup::Resolved(known) if known == sequence_hash => {}
-                ParentSequenceLookup::Resolved(_) | ParentSequenceLookup::Ambiguous => {
-                    return StoreMutationResult::RejectedMapping(
-                        CacheEvidenceMappingConflict::LookaheadParent,
-                    );
-                }
-            }
-        }
         let lookahead = (sequence_hash, block.tokens_hash);
         for source_tier in [CacheTier::Gpu, CacheTier::Cpu] {
             let key = (
@@ -1053,8 +1071,12 @@ impl CacheEvidenceLedger {
         group: u32,
         external_hash: Option<u64>,
         attested: Option<u64>,
+        contextual_parent: bool,
         planned: &mut HashMap<(u64, PhysicalCopy), PhysicalExternalEntry>,
     ) -> Result<Option<u64>, StoreMutationResult> {
+        if contextual_parent {
+            return attested.map(Some).ok_or(StoreMutationResult::Invalid);
+        }
         match (external_hash, attested) {
             (None, None) => Ok(None),
             (None, Some(_)) => Err(StoreMutationResult::Invalid),
@@ -1112,7 +1134,13 @@ impl CacheEvidenceLedger {
         group: u32,
         parent_external_hash: Option<u64>,
         attested_sequence_hash: Option<u64>,
+        contextual_parent: bool,
     ) -> Result<Option<u64>, StoreMutationResult> {
+        if contextual_parent {
+            return attested_sequence_hash
+                .map(Some)
+                .ok_or(StoreMutationResult::Invalid);
+        }
         match (parent_external_hash, attested_sequence_hash) {
             (None, None) => Ok(None),
             (None, Some(_)) => Err(StoreMutationResult::Invalid),
@@ -2108,6 +2136,7 @@ impl CacheLossFunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::TokensWithHashes;
 
     const WORKER_A: CacheOwner = CacheOwner {
         worker_id: 1,
@@ -2856,6 +2885,7 @@ mod tests {
                 group_idx: 0,
                 parent_external_hash: 100,
                 parent_sequence_hash,
+                contextual_parent: false,
                 blocks: vec![CacheEvidenceStoredBlock {
                     external_hash: 101,
                     tokens_hash: 20,
@@ -2896,6 +2926,7 @@ mod tests {
                 group_idx: 0,
                 parent_external_hash: 100,
                 parent_sequence_hash: 11,
+                contextual_parent: false,
                 blocks: vec![CacheEvidenceStoredBlock {
                     external_hash: 101,
                     tokens_hash: 20,
@@ -2934,6 +2965,7 @@ mod tests {
                 group_idx: 0,
                 parent_external_hash: 100,
                 parent_sequence_hash: 10,
+                contextual_parent: false,
                 blocks: vec![CacheEvidenceStoredBlock {
                     external_hash: 101,
                     tokens_hash: 20,
@@ -2982,6 +3014,7 @@ mod tests {
                 group_idx: 0,
                 parent_external_hash: 100,
                 parent_sequence_hash: 10,
+                contextual_parent: false,
                 blocks: vec![CacheEvidenceStoredBlock {
                     external_hash: 101,
                     tokens_hash: 20,
@@ -2991,6 +3024,146 @@ mod tests {
 
         assert!(result.is_complete());
         assert_eq!(ledger.stats().cpu_physical_blocks, 1);
+    }
+
+    #[test]
+    fn contextual_eagle_parents_may_share_an_external_hash() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.record_group_catalog(WORKER_A, CacheTier::Gpu, [0]);
+        ledger.seal_physical_scope();
+        let eagle_parent = |next_token| {
+            let mut tokens = (1..=8).collect::<Vec<_>>();
+            tokens.push(next_token);
+            let mut hashes = TokensWithHashes::new(tokens, 8).with_is_eagle(true);
+            hashes.get_or_compute_seq_hashes()[0]
+        };
+        let first_parent = eagle_parent(90);
+        let second_parent = eagle_parent(91);
+        assert_ne!(first_parent, second_parent);
+
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+            owner: WORKER_A,
+            source_cursor: 1,
+            source_incarnation_id: None,
+            barrier_id: None,
+            epoch_id: None,
+            heartbeat: false,
+            watermark_source_cursor: None,
+            telemetry_complete: true,
+            mutations: vec![
+                CacheEvidenceMutation::StoreWithParentAttestation {
+                    tier: CacheTier::Gpu,
+                    group_idx: 0,
+                    parent_external_hash: 100,
+                    parent_sequence_hash: first_parent,
+                    contextual_parent: true,
+                    blocks: vec![CacheEvidenceStoredBlock {
+                        external_hash: 101,
+                        tokens_hash: 20,
+                    }],
+                },
+                CacheEvidenceMutation::StoreWithParentAttestation {
+                    tier: CacheTier::Gpu,
+                    group_idx: 0,
+                    parent_external_hash: 100,
+                    parent_sequence_hash: second_parent,
+                    contextual_parent: true,
+                    blocks: vec![CacheEvidenceStoredBlock {
+                        external_hash: 102,
+                        tokens_hash: 21,
+                    }],
+                },
+            ],
+        });
+
+        assert!(result.is_complete());
+        assert_eq!(ledger.stats().gpu_physical_blocks, 2);
+        assert_eq!(
+            ledger.resident_on(
+                compute_next_seq_hash(first_parent, LocalBlockHash(20)),
+                WORKER_A
+            ),
+            KnownBool::Yes
+        );
+        assert_eq!(
+            ledger.resident_on(
+                compute_next_seq_hash(second_parent, LocalBlockHash(21)),
+                WORKER_A
+            ),
+            KnownBool::Yes
+        );
+    }
+
+    #[test]
+    fn stable_parents_still_reject_conflicting_batch_attestations() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.record_group_catalog(WORKER_A, CacheTier::Gpu, [0]);
+        ledger.seal_physical_scope();
+        let store = |parent_sequence_hash, external_hash, tokens_hash| {
+            CacheEvidenceMutation::StoreWithParentAttestation {
+                tier: CacheTier::Gpu,
+                group_idx: 0,
+                parent_external_hash: 100,
+                parent_sequence_hash,
+                contextual_parent: false,
+                blocks: vec![CacheEvidenceStoredBlock {
+                    external_hash,
+                    tokens_hash,
+                }],
+            }
+        };
+
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+            owner: WORKER_A,
+            source_cursor: 1,
+            source_incarnation_id: None,
+            barrier_id: None,
+            epoch_id: None,
+            heartbeat: false,
+            watermark_source_cursor: None,
+            telemetry_complete: true,
+            mutations: vec![store(10, 101, 20), store(11, 102, 21)],
+        });
+
+        assert_eq!(
+            result.mapping_conflicts().collect::<HashSet<_>>(),
+            HashSet::from([CacheEvidenceMappingConflict::BatchParentAttestation])
+        );
+        assert_eq!(ledger.stats().gpu_physical_blocks, 0);
+    }
+
+    #[test]
+    fn terminal_eagle_lookaheads_use_contextual_parent_attestations() {
+        let mut ledger = CacheEvidenceLedger::new(16);
+        ledger.record_group_catalog(WORKER_A, CacheTier::Gpu, [0]);
+        ledger.seal_physical_scope();
+        let lookahead = |sequence_hash, external_hash, tokens_hash| {
+            CacheEvidenceMutation::StoreEagleLookahead {
+                tier: CacheTier::Gpu,
+                group_idx: 0,
+                parent_external_hash: Some(100),
+                sequence_hash,
+                block: CacheEvidenceStoredBlock {
+                    external_hash,
+                    tokens_hash,
+                },
+            }
+        };
+
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+            owner: WORKER_A,
+            source_cursor: 1,
+            source_incarnation_id: None,
+            barrier_id: None,
+            epoch_id: None,
+            heartbeat: false,
+            watermark_source_cursor: None,
+            telemetry_complete: true,
+            mutations: vec![lookahead(10, 101, 20), lookahead(11, 102, 21)],
+        });
+
+        assert!(result.is_complete());
+        assert_eq!(ledger.stats().gpu_physical_blocks, 2);
     }
 
     #[test]
@@ -3017,6 +3190,7 @@ mod tests {
                 group_idx: 0,
                 parent_external_hash: 100,
                 parent_sequence_hash: 10,
+                contextual_parent: false,
                 blocks: vec![CacheEvidenceStoredBlock {
                     external_hash: 101,
                     tokens_hash: 20,

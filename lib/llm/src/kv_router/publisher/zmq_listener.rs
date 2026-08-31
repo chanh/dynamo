@@ -789,6 +789,7 @@ fn cache_evidence_mutation_with_resolver(
                         .ok_or(EvidenceMutationError::Invalid)?
                         .into_u64(),
                     parent_sequence_hash,
+                    contextual_parent: *is_eagle == Some(true),
                     blocks: stored,
                 }))
             } else {
@@ -1280,6 +1281,24 @@ mod tests {
                 group_idx: 4,
                 parent_external_hash: 41,
                 parent_sequence_hash: u64::MAX,
+                contextual_parent: false,
+                ..
+            }))
+        ));
+
+        if let RawKvEvent::BlockStored {
+            is_eagle,
+            token_ids,
+            ..
+        } = &mut event
+        {
+            *is_eagle = Some(true);
+            token_ids.push(2);
+        }
+        assert!(matches!(
+            cache_evidence_mutation(&event, None, &Arc::new(AtomicU32::new(0))),
+            Ok(Some(CacheEvidenceMutation::StoreWithParentAttestation {
+                contextual_parent: true,
                 ..
             }))
         ));
