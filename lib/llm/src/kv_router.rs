@@ -46,6 +46,8 @@ pub use dynamo_kv_router::selector;
 
 pub mod cache_loss;
 pub mod encoder_router;
+#[cfg(feature = "cache-loss-fault-injection")]
+mod fault_injection;
 pub mod indexer;
 pub mod metrics;
 pub mod prefill_router;

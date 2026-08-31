@@ -17,8 +17,48 @@ use dynamo_kv_router::cache_loss::{
 use dynamo_kv_router::protocols::*;
 use dynamo_kv_router::zmq_wire::*;
 
+#[cfg(feature = "cache-loss-fault-injection")]
+use crate::kv_router::fault_injection::{FaultStage, cache_loss_fault_injector};
 use crate::kv_router::metrics::kv_publisher_metrics;
 use crate::utils::zmq::{connect_sub_socket, multipart_message};
+
+#[cfg(feature = "cache-loss-fault-injection")]
+fn physical_retention_remove(mutation: &CacheEvidenceMutation) -> Option<CacheEvidenceMutation> {
+    let (tier, group_idx, block_hashes) = match mutation {
+        CacheEvidenceMutation::Store {
+            tier,
+            group_idx,
+            blocks,
+            ..
+        } => (
+            *tier,
+            *group_idx,
+            blocks.iter().map(|block| block.external_hash).collect(),
+        ),
+        CacheEvidenceMutation::StoreWithParentAttestation {
+            tier,
+            group_idx,
+            blocks,
+            ..
+        } => (
+            *tier,
+            Some(*group_idx),
+            blocks.iter().map(|block| block.external_hash).collect(),
+        ),
+        CacheEvidenceMutation::StoreEagleLookahead {
+            tier,
+            group_idx,
+            block,
+            ..
+        } => (*tier, Some(*group_idx), vec![block.external_hash]),
+        CacheEvidenceMutation::Remove { .. } | CacheEvidenceMutation::Clear { .. } => return None,
+    };
+    (!block_hashes.is_empty()).then_some(CacheEvidenceMutation::Remove {
+        tier,
+        group_idx,
+        block_hashes,
+    })
+}
 
 pub(super) struct DecodedZmqKvBatch {
     pub(super) source_cursor: u64,
@@ -359,6 +399,8 @@ pub(super) async fn start_zmq_listener(
     };
     let mut socket = socket;
     let metrics = kv_publisher_metrics();
+    #[cfg(feature = "cache-loss-fault-injection")]
+    let fault_injector = cache_loss_fault_injector();
     if cancellation_token.is_cancelled() {
         return;
     }
@@ -454,7 +496,8 @@ pub(super) async fn start_zmq_listener(
                 {
                     telemetry_complete = false;
                 }
-                let mutations = batch.events.iter().filter_map(|event| {
+                let mut mutations = Vec::with_capacity(batch.events.len());
+                for event in &batch.events {
                     match cache_evidence_mutation_with_resolver(
                         event,
                         owner,
@@ -462,7 +505,29 @@ pub(super) async fn start_zmq_listener(
                         &evidence_warning_count,
                         &mut evidence_hash_resolver,
                     ) {
-                        Ok(mutation) => mutation,
+                        Ok(Some(mutation)) => {
+                            #[cfg(feature = "cache-loss-fault-injection")]
+                            if fault_injector.inject_physical_retention(event) {
+                                if let Some(metrics) = &metrics {
+                                    metrics.observe_cache_loss_fault_injection(
+                                        FaultStage::PhysicalRetention,
+                                    );
+                                }
+                                tracing::warn!(
+                                    worker_id,
+                                    dp_rank,
+                                    engine_seq,
+                                    "Injected bounded physical-retention loss into the mirrored shadow arm"
+                                );
+                                if let Some(remove) = physical_retention_remove(&mutation) {
+                                    mutations.push(mutation);
+                                    mutations.push(remove);
+                                    continue;
+                                }
+                            }
+                            mutations.push(mutation);
+                        }
+                        Ok(None) => {}
                         Err(error) => {
                             telemetry_complete = false;
                             if let Some(metrics) = &metrics {
@@ -472,10 +537,9 @@ pub(super) async fn start_zmq_listener(
                                 );
                                 metrics.mark_telemetry_incomplete(error.metric_reason());
                             }
-                            None
                         }
                     }
-                }).collect();
+                }
                 if let Some(evidence_tx) = &evidence_tx {
                     if let Some(metrics) = &metrics {
                         metrics.increment_evidence_queue_depth();
@@ -507,6 +571,21 @@ pub(super) async fn start_zmq_listener(
                     let event_type = raw_event.event_type_label();
                     if let Some(metrics) = &metrics {
                         metrics.increment_zmq_event("received", event_type);
+                    }
+                    #[cfg(feature = "cache-loss-fault-injection")]
+                    if fault_injector.suppress_router_visibility(&raw_event) {
+                        if let Some(metrics) = &metrics {
+                            metrics.observe_cache_loss_fault_injection(
+                                FaultStage::RouterVisibility,
+                            );
+                        }
+                        tracing::warn!(
+                            worker_id,
+                            dp_rank,
+                            engine_seq,
+                            "Injected bounded router-visibility loss into the mirrored shadow arm"
+                        );
+                        continue;
                     }
                     let worker = WorkerWithDpRank::new(worker_id, dp_rank);
                     let raw_event = match normalizer.preprocess_with_reason(raw_event, worker) {
@@ -842,6 +921,48 @@ mod tests {
         worker_id: 7,
         dp_rank: 0,
     };
+
+    #[cfg(feature = "cache-loss-fault-injection")]
+    #[test]
+    fn physical_retention_fault_preserves_store_then_removes_exact_copy() {
+        let store = CacheEvidenceMutation::Store {
+            tier: CacheTier::Gpu,
+            group_idx: Some(2),
+            parent_external_hash: None,
+            blocks: vec![CacheEvidenceStoredBlock {
+                external_hash: 30,
+                tokens_hash: 40,
+            }],
+        };
+        let remove = physical_retention_remove(&store).unwrap();
+        assert_eq!(
+            remove,
+            CacheEvidenceMutation::Remove {
+                tier: CacheTier::Gpu,
+                group_idx: Some(2),
+                block_hashes: vec![30],
+            }
+        );
+        let mut ledger = CacheEvidenceLedger::new(8);
+        let result = ledger.apply_evidence_batch_with_diagnostics(&CacheEvidenceBatch {
+            owner: TEST_OWNER,
+            source_cursor: 1,
+            source_incarnation_id: Some(1),
+            heartbeat: false,
+            watermark_source_cursor: None,
+            telemetry_complete: true,
+            mutations: vec![store, remove],
+            barrier_id: None,
+            epoch_id: None,
+        });
+        assert!(result.is_complete());
+        assert_eq!(ledger.stats().history_blocks, 1);
+        assert_eq!(ledger.stats().gpu_physical_blocks, 0);
+        assert_eq!(
+            physical_retention_remove(&CacheEvidenceMutation::Clear { tier: None }),
+            None
+        );
+    }
 
     fn constituent_store(
         group_idx: u32,

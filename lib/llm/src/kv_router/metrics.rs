@@ -463,6 +463,10 @@ pub(crate) struct KvPublisherMetrics {
     pub source_out_of_order_total: IntCounter,
     /// Cache-evidence batches waiting for event-plane publication.
     pub evidence_queue_depth: IntGauge,
+    #[cfg(feature = "cache-loss-fault-injection")]
+    cache_loss_fault_armed: IntGaugeVec,
+    #[cfg(feature = "cache-loss-fault-injection")]
+    cache_loss_fault_injections_total: IntCounterVec,
 }
 
 static KV_PUBLISHER_METRICS: OnceLock<Arc<KvPublisherMetrics>> = OnceLock::new();
@@ -473,9 +477,12 @@ impl KvPublisherMetrics {
     /// injects hierarchy labels (including `worker_id`), and registers with the
     /// DRT `MetricsRegistry`.
     pub fn from_component(component: &Component) -> Arc<Self> {
-        KV_PUBLISHER_METRICS
+        let registered = KV_PUBLISHER_METRICS
             .get_or_init(|| Arc::new(Self::build(component)))
-            .clone()
+            .clone();
+        #[cfg(feature = "cache-loss-fault-injection")]
+        registered.update_cache_loss_fault_armed();
+        registered
     }
 
     /// Register the publisher's metrics against any metrics hierarchy.
@@ -562,6 +569,29 @@ impl KvPublisherMetrics {
                 &[],
             )
             .expect("failed to create kv_publisher_evidence_queue_depth");
+        #[cfg(feature = "cache-loss-fault-injection")]
+        let cache_loss_fault_armed = metrics
+            .create_intgaugevec(
+                "kv_publisher_cache_loss_fault_armed",
+                "Whether bounded cache-loss fault injection is armed for the mirrored shadow arm",
+                &["stage"],
+                &[],
+            )
+            .expect("failed to create cache-loss fault armed gauge");
+        #[cfg(feature = "cache-loss-fault-injection")]
+        let cache_loss_fault_injections_total = metrics
+            .create_intcountervec(
+                "kv_publisher_cache_loss_fault_injections_total",
+                "Real cache-loss state transitions injected into the mirrored shadow arm",
+                &["stage"],
+                &[],
+            )
+            .expect("failed to create cache-loss fault injection counter");
+        #[cfg(feature = "cache-loss-fault-injection")]
+        for stage in crate::kv_router::fault_injection::FaultStage::ALL {
+            cache_loss_fault_armed.with_label_values(&[stage.label()]);
+            cache_loss_fault_injections_total.with_label_values(&[stage.label()]);
+        }
 
         Self {
             engines_dropped_events_total,
@@ -574,6 +604,10 @@ impl KvPublisherMetrics {
             source_sequence_gaps_total,
             source_out_of_order_total,
             evidence_queue_depth,
+            #[cfg(feature = "cache-loss-fault-injection")]
+            cache_loss_fault_armed,
+            #[cfg(feature = "cache-loss-fault-injection")]
+            cache_loss_fault_injections_total,
         }
     }
 
@@ -634,6 +668,26 @@ impl KvPublisherMetrics {
         self.telemetry_complete.set(0);
         self.telemetry_incomplete_total
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    #[cfg(feature = "cache-loss-fault-injection")]
+    fn update_cache_loss_fault_armed(&self) {
+        let armed = crate::kv_router::fault_injection::cache_loss_fault_injector().armed_stage();
+        for stage in crate::kv_router::fault_injection::FaultStage::ALL {
+            self.cache_loss_fault_armed
+                .with_label_values(&[stage.label()])
+                .set(i64::from(armed == Some(stage)));
+        }
+    }
+
+    #[cfg(feature = "cache-loss-fault-injection")]
+    pub(super) fn observe_cache_loss_fault_injection(
+        &self,
+        stage: crate::kv_router::fault_injection::FaultStage,
+    ) {
+        self.cache_loss_fault_injections_total
+            .with_label_values(&[stage.label()])
             .inc();
     }
 }
@@ -2151,6 +2205,30 @@ mod kv_publisher_registration_tests {
                 "{name} never reached the metrics registry. Exposition was:\n{expfmt}"
             );
         }
+    }
+
+    #[cfg(feature = "cache-loss-fault-injection")]
+    #[test]
+    fn bounded_fault_metrics_export_armed_and_injection_stages() {
+        let hierarchy = FakeHierarchy::component("dynamo", "backend", 0x7f3a1c);
+        let metrics = KvPublisherMetrics::build(&hierarchy);
+        metrics.observe_cache_loss_fault_injection(
+            crate::kv_router::fault_injection::FaultStage::RouterVisibility,
+        );
+
+        let expfmt = hierarchy.expfmt();
+        for name in [
+            exported_name("kv_publisher_cache_loss_fault_armed"),
+            exported_name("kv_publisher_cache_loss_fault_injections_total"),
+        ] {
+            assert!(
+                sample_line(&expfmt, &name).is_some(),
+                "{name} absent from exposition:\n{expfmt}"
+            );
+        }
+        assert!(expfmt.contains(
+            "kv_publisher_cache_loss_fault_injections_total{dynamo_component=\"backend\",dynamo_namespace=\"dynamo\",stage=\"router_visibility\",worker_id=\"7f3a1c\"} 1"
+        ));
     }
 
     #[test]

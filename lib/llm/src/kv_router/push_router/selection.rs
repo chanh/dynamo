@@ -197,8 +197,19 @@ where
             session_context,
         } = options;
         let affinity_pin = affinity_worker.map(|worker| (worker.worker_id, Some(worker.dp_rank)));
+        #[cfg(feature = "cache-loss-fault-injection")]
+        let fault_target = (explicit_pin.is_none() && affinity_pin.is_none() && !is_query_only)
+            .then(|| {
+                crate::kv_router::fault_injection::cache_loss_fault_injector()
+                    .route_target(context_id)
+            })
+            .flatten();
+        #[cfg(feature = "cache-loss-fault-injection")]
+        let fault_pin = fault_target.map(|worker| (worker.worker_id, Some(worker.dp_rank)));
+        #[cfg(not(feature = "cache-loss-fault-injection"))]
+        let fault_pin = None;
         let Some((pinned_worker_id, requested_dp_rank)) =
-            merge_affinity_pin(explicit_pin, affinity_pin)
+            merge_affinity_pin(explicit_pin, affinity_pin).or(fault_pin)
         else {
             let _nvtx_kv = dynamo_nvtx_range!("route.kv_match");
             let selection = self
@@ -274,24 +285,39 @@ where
             "Routing to specified worker"
         );
 
-        self.select_best_match(BestMatchArgs {
-            context_id,
-            routing_parts,
-            router_config_override: request.router_config_override.as_ref(),
-            update_states: !is_query_only,
-            return_routing_hashes,
-            lora_name,
-            cache_namespace,
-            priority_jump,
-            strict_priority,
-            policy_class,
-            session_context,
-            expected_output_tokens,
-            pinned_worker: Some(pinned_worker),
-            allowed_worker_ids,
-            routing_constraints,
-        })
-        .await
+        let selection = self
+            .select_best_match(BestMatchArgs {
+                context_id,
+                routing_parts,
+                router_config_override: request.router_config_override.as_ref(),
+                update_states: !is_query_only,
+                return_routing_hashes,
+                lora_name,
+                cache_namespace,
+                priority_jump,
+                strict_priority,
+                policy_class,
+                session_context,
+                expected_output_tokens,
+                pinned_worker: Some(pinned_worker),
+                allowed_worker_ids,
+                routing_constraints,
+            })
+            .await?;
+        #[cfg(feature = "cache-loss-fault-injection")]
+        if fault_target == Some(selection.worker) {
+            if let Some(metrics) = crate::kv_router::metrics::kv_publisher_metrics() {
+                metrics.observe_cache_loss_fault_injection(
+                    crate::kv_router::fault_injection::FaultStage::RoutingChoice,
+                );
+            }
+            tracing::warn!(
+                worker_id = selection.worker.worker_id,
+                dp_rank = selection.worker.dp_rank,
+                "Injected bounded routing-choice loss into the mirrored shadow arm"
+            );
+        }
+        Ok(selection)
     }
 }
 
