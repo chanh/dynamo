@@ -47,6 +47,7 @@ pub use dynamo_kv_router::selector;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
+pub(crate) mod minimal_cache_loss;
 pub mod prefill_router;
 pub mod publisher;
 pub mod push_router;
@@ -173,6 +174,8 @@ pub enum FindBestMatchOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        max_router_visible_tokens: u64,
+        selected_router_visible_tokens: u64,
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         router_hint: Option<RouterHint>,
@@ -1036,6 +1039,7 @@ where
         let overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
+        let max_router_visible_tokens = max_router_visible_tokens(&overlap, self.block_size);
         let router_hint_candidates = retain_router_hint_chain
             .then(|| tiered_matches.router_hint_root_candidates().cloned())
             .flatten();
@@ -1107,6 +1111,8 @@ where
                 Err(error) => return Err(map_scheduler_error(error)),
             },
         };
+        let selected_router_visible_tokens = u64::from(response.target_cached_prefix_blocks)
+            .saturating_mul(u64::from(self.block_size));
         let router_hint = if is_admitted_routing {
             self.router_hint_for_selection(
                 response.best_worker,
@@ -1163,6 +1169,8 @@ where
                     overlap_blocks: response.effective_overlap_blocks.round() as u32,
                     effective_overlap_blocks: response.effective_overlap_blocks,
                     cached_tokens: response.cached_tokens,
+                    max_router_visible_tokens,
+                    selected_router_visible_tokens,
                     potential_decode_blocks: response.potential_decode_blocks as u64,
                     routing_hashes,
                     router_hint,
@@ -1566,6 +1574,25 @@ where
     pub async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
         self.indexer.dump_events().await
     }
+}
+
+fn max_router_visible_tokens(
+    overlap: &dynamo_kv_router::scheduling::OverlapSignals,
+    block_size: u32,
+) -> u64 {
+    let tiers = &overlap.tier_overlap_blocks;
+    let max_blocks = tiers
+        .device
+        .iter()
+        .map(|(worker, device)| {
+            device.saturating_add(tiers.host_pinned.get(worker).copied().unwrap_or(0))
+        })
+        .chain(tiers.host_pinned.iter().map(|(worker, host)| {
+            host.saturating_add(tiers.device.get(worker).copied().unwrap_or(0))
+        }))
+        .max()
+        .unwrap_or(0);
+    (max_blocks as u64).saturating_mul(u64::from(block_size))
 }
 
 // NOTE: KVRouter works like a PushRouter,

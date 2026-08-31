@@ -21,8 +21,8 @@ use tracing::Instrument;
 
 use crate::{
     kv_router::{
-        KvRouter, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector,
-        to_worker_selection_session_context,
+        KvRouter, metrics::RouterRequestMetrics, minimal_cache_loss::RouteObservation,
+        scheduler::DefaultWorkerSelector, to_worker_selection_session_context,
     },
     local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
@@ -282,6 +282,12 @@ where
         let routing_parts = RoutingRequestParts::new(request);
         let block_size = self.chooser.block_size() as usize;
         let selected_worker = selection.worker;
+        let cache_loss = RouteObservation {
+            prompt_tokens: routing_parts.token_ids.len() as u64,
+            best_router_tokens: selection.max_router_visible_tokens,
+            selected_router_tokens: selection.selected_router_visible_tokens,
+        }
+        .bounded();
         let mut guard = RequestGuard::new(
             self.chooser.clone(),
             self.request_metrics.clone(),
@@ -289,6 +295,7 @@ where
             selected_worker,
             request,
             !is_query_only,
+            cache_loss,
         );
 
         let record_result: Result<(), Error> = async {
@@ -798,6 +805,11 @@ mod tests {
             WorkerWithDpRank::from_worker_id(0),
             &request(),
             false,
+            RouteObservation {
+                prompt_tokens: 0,
+                best_router_tokens: 0,
+                selected_router_tokens: 0,
+            },
         );
         let monitored = monitor_response_stream(source, context, guard);
         tokio::pin!(monitored);

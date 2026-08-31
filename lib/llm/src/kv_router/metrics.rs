@@ -843,6 +843,8 @@ pub struct RouterRequestMetrics {
     pub non_max_overlap_selections_total: IntCounterVec,
     pub overlap_blocks_lost: HistogramVec,
     pub avoidable_prefill_tokens_total: IntCounterVec,
+    pub cache_loss_funnel_tokens_total: IntCounterVec,
+    pub cache_loss_observations_total: IntCounterVec,
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -989,6 +991,28 @@ impl RouterRequestMetrics {
                     overlap_blocks_lost.with_label_values(&[worker_type]);
                     avoidable_prefill_tokens_total.with_label_values(&[worker_type]);
                 }
+                let cache_loss_funnel_tokens_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_funnel_tokens_total"),
+                        "Prompt tokens remaining at each cache-loss funnel stage",
+                        &["stage"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_funnel_tokens_total");
+                let cache_loss_observations_total = metrics
+                    .create_intcountervec(
+                        &router_metric("cache_loss_observations_total"),
+                        "Cache-loss funnel observations by result",
+                        &["result"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_observations_total");
+                for stage in ["f0", "f1", "f2", "f3", "f4"] {
+                    cache_loss_funnel_tokens_total.with_label_values(&[stage]);
+                }
+                for result in ["complete", "incomplete"] {
+                    cache_loss_observations_total.with_label_values(&[result]);
+                }
                 Arc::new(Self {
                     requests_total,
                     time_to_first_token_seconds,
@@ -1002,6 +1026,8 @@ impl RouterRequestMetrics {
                     non_max_overlap_selections_total,
                     overlap_blocks_lost,
                     avoidable_prefill_tokens_total,
+                    cache_loss_funnel_tokens_total,
+                    cache_loss_observations_total,
                 })
             })
             .clone()
@@ -1024,6 +1050,29 @@ impl RouterRequestMetrics {
         self.avoidable_prefill_tokens_total
             .with_label_values(&[worker_type])
             .inc_by(avoidable_prefill_tokens);
+    }
+
+    pub fn observe_cache_loss_input(&self, prompt_tokens: u64) {
+        self.cache_loss_funnel_tokens_total
+            .with_label_values(&["f0"])
+            .inc_by(prompt_tokens);
+    }
+
+    pub fn observe_cache_loss_funnel(&self, stages_after_input: [u64; 4]) {
+        for (stage, tokens) in ["f1", "f2", "f3", "f4"].into_iter().zip(stages_after_input) {
+            self.cache_loss_funnel_tokens_total
+                .with_label_values(&[stage])
+                .inc_by(tokens);
+        }
+        self.cache_loss_observations_total
+            .with_label_values(&["complete"])
+            .inc();
+    }
+
+    pub fn observe_cache_loss_incomplete(&self) {
+        self.cache_loss_observations_total
+            .with_label_values(&["incomplete"])
+            .inc();
     }
 }
 

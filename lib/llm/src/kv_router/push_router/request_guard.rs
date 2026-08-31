@@ -11,7 +11,10 @@ use dynamo_runtime::{
 };
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector},
+    kv_router::{
+        KvRouter, metrics::RouterRequestMetrics, minimal_cache_loss::RouteObservation,
+        scheduler::DefaultWorkerSelector,
+    },
     local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
     protocols::common::{
@@ -227,6 +230,15 @@ struct OutputBlockUpdate {
     decay_fraction: Option<f64>,
 }
 
+#[derive(serde::Deserialize)]
+struct CacheLossWorkerOutcome {
+    complete: bool,
+    prompt_tokens: u64,
+    gpu_hit_tokens: u64,
+    cpu_hit_tokens: u64,
+    cpu_lookup_tokens: u64,
+}
+
 /// Tracks when streamed output grows into a new scheduler accounting block.
 struct OutputBlockTracker {
     track_output_blocks: bool,
@@ -284,6 +296,8 @@ where
     output_blocks: OutputBlockTracker,
     prefill_marked: bool,
     migration_state: Option<MigrationState>,
+    cache_loss: Option<RouteObservation>,
+    cache_loss_recorded: bool,
 }
 
 impl<Sel> RequestGuard<Sel>
@@ -297,6 +311,7 @@ where
         worker: WorkerWithDpRank,
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
+        cache_loss: RouteObservation,
     ) -> Self {
         // Snapshot request-scoped inputs now so the guard can outlive the
         // PreprocessedRequest after it is moved into backend dispatch.
@@ -311,6 +326,9 @@ where
         if scheduler_tracked {
             request_metrics.requests_started_total().inc();
         }
+        if scheduler_tracked {
+            request_metrics.observe_cache_loss_input(cache_loss.prompt_tokens);
+        }
 
         Self {
             cleanup: RequestCleanup::new(chooser, context_id, worker, scheduler_tracked),
@@ -323,6 +341,8 @@ where
             ),
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
+            cache_loss: scheduler_tracked.then_some(cache_loss),
+            cache_loss_recorded: false,
         }
     }
 
@@ -376,6 +396,7 @@ where
 
         let new_tokens = item.data.as_ref().map_or(0, |data| data.token_ids.len());
         self.observability.observe_tokens(new_tokens);
+        self.observe_cache_loss_worker_outcome(item);
         let cumulative_osl = self.observability.cumulative_osl();
         let Some(update) = self.output_blocks.observe(cumulative_osl) else {
             return;
@@ -398,12 +419,65 @@ where
 
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
+        self.record_cache_loss_incomplete();
         self.observability.record_metrics();
         self.cleanup.finish().await;
     }
 
     pub(super) async fn abort(&mut self) {
+        self.record_cache_loss_incomplete();
         self.cleanup.finish().await;
+    }
+
+    fn observe_cache_loss_worker_outcome(&mut self, item: &Annotated<LLMEngineOutput>) {
+        if self.cache_loss_recorded {
+            return;
+        }
+        let Some(value) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.engine_data.as_ref())
+            .and_then(|data| data.get("cache_loss"))
+        else {
+            return;
+        };
+        let Ok(outcome) = serde_json::from_value::<CacheLossWorkerOutcome>(value.clone()) else {
+            self.record_cache_loss_incomplete();
+            return;
+        };
+        let Some(route) = self.cache_loss else {
+            self.record_cache_loss_incomplete();
+            return;
+        };
+        if !outcome.complete || outcome.prompt_tokens != route.prompt_tokens {
+            self.record_cache_loss_incomplete();
+            return;
+        }
+
+        let f1 = route.best_router_tokens;
+        let f2 = route.selected_router_tokens.min(f1);
+        let f3 = outcome
+            .gpu_hit_tokens
+            .saturating_add(outcome.cpu_lookup_tokens)
+            .min(f2);
+        let f4 = outcome
+            .gpu_hit_tokens
+            .saturating_add(outcome.cpu_hit_tokens)
+            .min(f3);
+        self.observability
+            .request_metrics()
+            .observe_cache_loss_funnel([f1, f2, f3, f4]);
+        self.cache_loss_recorded = true;
+    }
+
+    fn record_cache_loss_incomplete(&mut self) {
+        if self.cache_loss_recorded || self.cache_loss.is_none() {
+            return;
+        }
+        self.observability
+            .request_metrics()
+            .observe_cache_loss_incomplete();
+        self.cache_loss_recorded = true;
     }
 }
 
