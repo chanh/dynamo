@@ -3,6 +3,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use parking_lot::Mutex;
+
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerWithDpRank},
     selector::WorkerSelector,
@@ -21,8 +23,11 @@ use tracing::Instrument;
 
 use crate::{
     kv_router::{
-        KvRouter, metrics::RouterRequestMetrics, minimal_cache_loss::RouteObservation,
-        scheduler::DefaultWorkerSelector, to_worker_selection_session_context,
+        KvRouter,
+        metrics::RouterRequestMetrics,
+        minimal_cache_loss::{CacheHistory, CacheHistoryRequest, RouteObservation},
+        scheduler::DefaultWorkerSelector,
+        to_worker_selection_session_context,
     },
     local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
@@ -122,6 +127,7 @@ where
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter<Sel>>,
     request_metrics: Arc<RouterRequestMetrics>,
+    cache_history: Arc<Mutex<CacheHistory>>,
     affinity: Option<AffinityCoordinator>,
 }
 
@@ -151,11 +157,25 @@ where
         // and the standalone router create KvPushRouter, so this covers both.
         let request_metrics =
             RouterRequestMetrics::from_component(chooser.client().endpoint.component());
+        let cache_history = CacheHistory::from_env(chooser.block_size());
+        {
+            let history = cache_history.lock();
+            let stats = history.stats();
+            request_metrics.set_cache_loss_history(
+                stats.retained_records,
+                stats.retained_unique_hashes,
+                stats.represented_tokens,
+                stats.estimated_retained_bytes,
+                stats.capacity_bytes,
+                stats.capacity_blocks,
+            );
+        }
 
         KvPushRouter {
             inner,
             chooser,
             request_metrics,
+            cache_history,
             affinity,
         }
     }
@@ -282,8 +302,25 @@ where
         let routing_parts = RoutingRequestParts::new(request);
         let block_size = self.chooser.block_size() as usize;
         let selected_worker = selection.worker;
+        let cache_history = CacheHistoryRequest::new(
+            routing_parts.token_ids.to_vec(),
+            routing_parts.block_mm_infos.map(ToOwned::to_owned),
+            request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.lora_name.clone()),
+            request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.cache_namespace.clone()),
+            self.chooser.block_size(),
+            self.chooser.is_eagle(),
+        );
+        let previously_computed_tokens =
+            cache_history.previously_computed_tokens(&self.cache_history.lock());
         let cache_loss = RouteObservation {
             prompt_tokens: routing_parts.token_ids.len() as u64,
+            previously_computed_tokens,
             best_router_tokens: selection.max_router_visible_tokens,
             selected_router_tokens: selection.selected_router_visible_tokens,
         }
@@ -296,6 +333,8 @@ where
             request,
             !is_query_only,
             cache_loss,
+            self.cache_history.clone(),
+            cache_history,
         );
 
         let record_result: Result<(), Error> = async {
@@ -807,9 +846,12 @@ mod tests {
             false,
             RouteObservation {
                 prompt_tokens: 0,
+                previously_computed_tokens: 0,
                 best_router_tokens: 0,
                 selected_router_tokens: 0,
             },
+            CacheHistory::from_env(router.chooser.block_size()),
+            CacheHistoryRequest::new(vec![], None, None, None, router.chooser.block_size(), false),
         );
         let monitored = monitor_response_stream(source, context, guard);
         tokio::pin!(monitored);

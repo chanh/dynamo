@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use dynamo_kv_router::{protocols::WorkerWithDpRank, selector::WorkerSelector};
 use dynamo_runtime::{
     error::DynamoError,
@@ -12,7 +14,9 @@ use dynamo_runtime::{
 
 use crate::{
     kv_router::{
-        KvRouter, metrics::RouterRequestMetrics, minimal_cache_loss::RouteObservation,
+        KvRouter,
+        metrics::RouterRequestMetrics,
+        minimal_cache_loss::{CacheHistory, CacheHistoryRequest, RouteObservation},
         scheduler::DefaultWorkerSelector,
     },
     local_model::runtime_config::ModelRuntimeConfig,
@@ -298,6 +302,8 @@ where
     migration_state: Option<MigrationState>,
     cache_loss: Option<RouteObservation>,
     cache_loss_recorded: bool,
+    cache_history: Arc<Mutex<CacheHistory>>,
+    cache_history_request: Option<CacheHistoryRequest>,
 }
 
 impl<Sel> RequestGuard<Sel>
@@ -312,6 +318,8 @@ where
         request: &PreprocessedRequest,
         scheduler_tracked: bool,
         cache_loss: RouteObservation,
+        cache_history: Arc<Mutex<CacheHistory>>,
+        cache_history_request: CacheHistoryRequest,
     ) -> Self {
         // Snapshot request-scoped inputs now so the guard can outlive the
         // PreprocessedRequest after it is moved into backend dispatch.
@@ -343,6 +351,8 @@ where
             migration_state: request.migration_state.clone(),
             cache_loss: scheduler_tracked.then_some(cache_loss),
             cache_loss_recorded: false,
+            cache_history,
+            cache_history_request: scheduler_tracked.then_some(cache_history_request),
         }
     }
 
@@ -395,6 +405,11 @@ where
         }
 
         let new_tokens = item.data.as_ref().map_or(0, |data| data.token_ids.len());
+        if let (Some(data), Some(history)) =
+            (item.data.as_ref(), self.cache_history_request.as_mut())
+        {
+            history.observe_output(data.index.unwrap_or(0), &data.token_ids);
+        }
         self.observability.observe_tokens(new_tokens);
         self.observe_cache_loss_worker_outcome(item);
         let cumulative_osl = self.observability.cumulative_osl();
@@ -420,12 +435,14 @@ where
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
         self.record_cache_loss_incomplete();
+        self.finalize_cache_history();
         self.observability.record_metrics();
         self.cleanup.finish().await;
     }
 
     pub(super) async fn abort(&mut self) {
         self.record_cache_loss_incomplete();
+        self.finalize_cache_history();
         self.cleanup.finish().await;
     }
 
@@ -454,19 +471,33 @@ where
             return;
         }
 
-        let f1 = route.best_router_tokens;
-        let f2 = route.selected_router_tokens.min(f1);
-        let f3 = outcome
-            .gpu_hit_tokens
-            .saturating_add(outcome.cpu_lookup_tokens)
-            .min(f2);
+        let f1 = route.previously_computed_tokens;
+        let f2 = route.best_router_tokens.min(f1);
+        let f3 = route.selected_router_tokens.min(f2);
         let f4 = outcome
             .gpu_hit_tokens
-            .saturating_add(outcome.cpu_hit_tokens)
+            .saturating_add(outcome.cpu_lookup_tokens)
             .min(f3);
+        let f5 = outcome
+            .gpu_hit_tokens
+            .saturating_add(outcome.cpu_hit_tokens)
+            .min(f4);
         self.observability
             .request_metrics()
-            .observe_cache_loss_funnel([route.prompt_tokens, f1, f2, f3, f4]);
+            .observe_cache_loss_funnel([route.prompt_tokens, f1, f2, f3, f4, f5]);
+        if let Some(history_request) = self.cache_history_request.as_mut() {
+            let mut history = self.cache_history.lock();
+            history_request.record_prompt(&mut history);
+            let stats = history.stats();
+            self.observability.request_metrics().set_cache_loss_history(
+                stats.retained_records,
+                stats.retained_unique_hashes,
+                stats.represented_tokens,
+                stats.estimated_retained_bytes,
+                stats.capacity_bytes,
+                stats.capacity_blocks,
+            );
+        }
         self.cache_loss_recorded = true;
     }
 
@@ -479,6 +510,23 @@ where
             .observe_cache_loss_incomplete();
         self.cache_loss_recorded = true;
     }
+
+    fn finalize_cache_history(&mut self) {
+        let Some(history_request) = self.cache_history_request.as_mut() else {
+            return;
+        };
+        let mut history = self.cache_history.lock();
+        history_request.finalize(&mut history);
+        let stats = history.stats();
+        self.observability.request_metrics().set_cache_loss_history(
+            stats.retained_records,
+            stats.retained_unique_hashes,
+            stats.represented_tokens,
+            stats.estimated_retained_bytes,
+            stats.capacity_bytes,
+            stats.capacity_blocks,
+        );
+    }
 }
 
 impl<Sel> Drop for RequestGuard<Sel>
@@ -487,6 +535,7 @@ where
 {
     fn drop(&mut self) {
         // RequestCleanup drops immediately afterward and performs resource cleanup.
+        self.finalize_cache_history();
         self.observability.record_metrics();
     }
 }
