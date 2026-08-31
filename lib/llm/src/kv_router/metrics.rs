@@ -89,11 +89,13 @@ pub(crate) struct CacheEvidenceMetrics {
     bounded_fresh_owners: IntGauge,
     watermark_age_ms: IntGauge,
     barrier_rtt_seconds: prometheus::Histogram,
+    exact_audits_requested_total: IntCounter,
     barrier_timeouts_total: IntCounter,
     barrier_coalesced_total: IntCounter,
     barrier_pending: IntGauge,
     barrier_overflow_total: IntCounter,
     barrier_incomplete_total: IntCounterVec,
+    route_snapshot_seconds: HistogramVec,
     cold_epoch_total: IntCounterVec,
 }
 
@@ -201,6 +203,13 @@ impl CacheEvidenceMetrics {
                         Some(prometheus::exponential_buckets(0.0005, 2.0, 12).unwrap()),
                     )
                     .expect("cache evidence barrier RTT metric");
+                let exact_audits_requested_total = metrics
+                    .create_intcounter(
+                        &router_metric("cache_loss_evidence_exact_audits_requested_total"),
+                        "Sampled route-time exact cache-evidence audits requested",
+                        labels,
+                    )
+                    .expect("cache evidence exact audit metric");
                 let barrier_timeouts_total = metrics
                     .create_intcounter(
                         &router_metric("cache_loss_evidence_barrier_timeouts_total"),
@@ -234,6 +243,18 @@ impl CacheEvidenceMetrics {
                         labels,
                     )
                     .expect("cache evidence barrier incomplete metric");
+                let route_snapshot_seconds = metrics
+                    .create_histogramvec(
+                        &router_metric("cache_loss_route_snapshot_seconds"),
+                        "Completed cache-loss route snapshot latency by bounded phase",
+                        &["phase"],
+                        labels,
+                        Some(prometheus::exponential_buckets(0.000_001, 2.0, 18).unwrap()),
+                    )
+                    .expect("cache-loss route snapshot metric");
+                for phase in ["hash", "ledger", "total"] {
+                    route_snapshot_seconds.with_label_values(&[phase]);
+                }
                 let cold_epoch_total = metrics
                     .create_intcountervec(
                         &router_metric("cache_loss_cold_epoch_total"),
@@ -321,11 +342,13 @@ impl CacheEvidenceMetrics {
                     bounded_fresh_owners,
                     watermark_age_ms,
                     barrier_rtt_seconds,
+                    exact_audits_requested_total,
                     barrier_timeouts_total,
                     barrier_coalesced_total,
                     barrier_pending,
                     barrier_overflow_total,
                     barrier_incomplete_total,
+                    route_snapshot_seconds,
                     cold_epoch_total,
                 })
             })
@@ -398,6 +421,10 @@ impl CacheEvidenceMetrics {
         self.barrier_rtt_seconds.observe(rtt.as_secs_f64());
     }
 
+    pub(crate) fn observe_exact_audit_requested(&self) {
+        self.exact_audits_requested_total.inc();
+    }
+
     pub(crate) fn observe_barrier_coalesced(&self, count: usize) {
         if count > 1 {
             self.barrier_coalesced_total.inc_by((count - 1) as u64);
@@ -418,6 +445,12 @@ impl CacheEvidenceMetrics {
         } else if reason == "journal_overflow" {
             self.barrier_overflow_total.inc();
         }
+    }
+
+    pub(crate) fn observe_route_snapshot(&self, phase: &'static str, elapsed: Duration) {
+        self.route_snapshot_seconds
+            .with_label_values(&[phase])
+            .observe(elapsed.as_secs_f64());
     }
 
     pub(crate) fn observe_cold_epoch(&self, result: &'static str) {

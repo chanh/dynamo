@@ -5,7 +5,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -43,6 +46,8 @@ const CACHE_LOSS_BARRIER_TIMEOUT_MS_ENV: &str = "DYN_CACHE_LOSS_BARRIER_TIMEOUT_
 const DEFAULT_CACHE_LOSS_BARRIER_TIMEOUT_MS: u64 = 250;
 const CACHE_LOSS_BARRIER_PENDING_ENV: &str = "DYN_CACHE_LOSS_BARRIER_PENDING";
 const DEFAULT_CACHE_LOSS_BARRIER_PENDING: usize = 1_024;
+const CACHE_LOSS_EXACT_SAMPLE_EVERY_ENV: &str = "DYN_CACHE_LOSS_EXACT_SAMPLE_EVERY";
+const DEFAULT_CACHE_LOSS_EXACT_SAMPLE_EVERY: u64 = 100;
 const CACHE_LOSS_COLD_EPOCH_SINGLE_FRONTEND_ENV: &str = "DYN_CACHE_LOSS_COLD_EPOCH_SINGLE_FRONTEND";
 const CACHE_LOSS_COLD_EPOCH_READINESS_MS_ENV: &str = "DYN_CACHE_LOSS_COLD_EPOCH_READINESS_MS";
 const DEFAULT_COLD_EPOCH_READINESS_MS: u64 = 120_000;
@@ -849,6 +854,17 @@ fn barrier_pending_capacity() -> usize {
         .unwrap_or(DEFAULT_CACHE_LOSS_BARRIER_PENDING)
 }
 
+fn exact_sample_every() -> u64 {
+    std::env::var(CACHE_LOSS_EXACT_SAMPLE_EVERY_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_CACHE_LOSS_EXACT_SAMPLE_EVERY)
+}
+
+fn take_exact_sample(counter: &AtomicU64, every: u64) -> bool {
+    every > 0 && counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % every == 0
+}
+
 fn cold_epoch_readiness_timeout() -> Duration {
     Duration::from_millis(
         std::env::var(CACHE_LOSS_COLD_EPOCH_READINESS_MS_ENV)
@@ -968,6 +984,8 @@ pub struct CacheEvidenceSubscription {
     dispatch_gate: watch::Receiver<bool>,
     dispatch_fence: Arc<tokio::sync::RwLock<()>>,
     barrier_tx: mpsc::UnboundedSender<u64>,
+    exact_sample_every: u64,
+    exact_sample_counter: AtomicU64,
     cancel: CancellationToken,
     task: JoinHandle<()>,
     barrier_task: JoinHandle<()>,
@@ -1010,9 +1028,8 @@ pub struct CacheLossRouteObservation {
 }
 
 impl CacheLossRouteObservation {
-    /// Apply an already resolved barrier without awaiting. Returns false only
-    /// while a barrier is still pending, so streaming metrics cannot consume a
-    /// provisional bounded observation after its exactness result is ready.
+    /// Apply an already resolved exactness audit without awaiting. Returns false
+    /// only while the sampled audit is still pending.
     pub(crate) fn finalize_barrier_if_ready(&mut self) -> bool {
         let Some(ticket) = self.barrier.as_ref() else {
             return true;
@@ -1040,11 +1057,9 @@ impl CacheLossRouteObservation {
     fn apply_barrier_outcome(&mut self, outcome: BarrierOutcome) {
         match outcome {
             BarrierOutcome::Exact => self.quality = CacheEvidenceQuality::Exact,
-            BarrierOutcome::Incomplete(reason) => {
-                self.complete = false;
-                self.quality = CacheEvidenceQuality::Incomplete;
-                self.incomplete_reason = Some(reason);
-            }
+            // The route snapshot was already proven bounded-fresh. An exactness
+            // audit failure cannot erase that independently useful evidence.
+            BarrierOutcome::Incomplete(_) => {}
             BarrierOutcome::Pending => unreachable!("barrier wait returned pending"),
         }
     }
@@ -1100,14 +1115,42 @@ impl CacheEvidenceSubscription {
         selected_serving_incarnation: Option<u64>,
         router_visible_prefix_tokens: u64,
     ) -> CacheLossRouteObservation {
+        let snapshot_started = Instant::now();
         let prompt_tokens = tokens.len() as u64;
         let max_hit_tokens = prompt_tokens.saturating_sub(1);
         let owner = CacheOwner {
             worker_id: selected.worker_id,
             dp_rank: selected.dp_rank,
         };
-        // Serialize the catalog, ledger snapshot, and cut registration with evidence
-        // application so a concurrent catalog change cannot escape invalidation.
+        let Some(catalog) = self.group_shapes.lock().get(&owner).cloned() else {
+            return CacheLossRouteObservation {
+                prompt_tokens,
+                incomplete_reason: Some("missing_cache_group_catalog"),
+                ..Default::default()
+            };
+        };
+        if block_mm_infos.is_some() {
+            return CacheLossRouteObservation {
+                prompt_tokens,
+                incomplete_reason: Some("hybrid_multimodal_hashing_not_supported"),
+                ..Default::default()
+            };
+        }
+        let hash_started = Instant::now();
+        let Some(group_hashes) = cache_group_hashes(tokens, &catalog, lora_name, cache_namespace)
+        else {
+            return CacheLossRouteObservation {
+                prompt_tokens,
+                incomplete_reason: Some("unsupported_cache_group_shape"),
+                ..Default::default()
+            };
+        };
+        self.metrics
+            .observe_route_snapshot("hash", hash_started.elapsed());
+
+        // Cache-event application takes the barrier lock before changing either
+        // catalogs or the ledger. Hash outside that lock, then revalidate the
+        // catalog while holding it before reading the corresponding ledger state.
         let mut barriers = self.barriers.lock();
         let expected_owners: HashSet<_> = barriers.owners.keys().copied().collect();
         if !barriers.matches_selected_incarnation(owner, selected_serving_incarnation) {
@@ -1118,36 +1161,16 @@ impl CacheEvidenceSubscription {
             };
         }
         let catalogs = self.group_shapes.lock();
-        if catalogs.keys().copied().collect::<HashSet<_>>() != expected_owners {
+        if catalogs.keys().copied().collect::<HashSet<_>>() != expected_owners
+            || catalogs.get(&owner) != Some(&catalog)
+        {
             return CacheLossRouteObservation {
                 prompt_tokens,
                 incomplete_reason: Some("barrier_catalog_membership_mismatch"),
                 ..Default::default()
             };
         }
-        let Some(catalog) = catalogs.get(&owner).cloned() else {
-            return CacheLossRouteObservation {
-                prompt_tokens,
-                incomplete_reason: Some("missing_cache_group_catalog"),
-                ..Default::default()
-            };
-        };
         drop(catalogs);
-        if block_mm_infos.is_some() {
-            return CacheLossRouteObservation {
-                prompt_tokens,
-                incomplete_reason: Some("hybrid_multimodal_hashing_not_supported"),
-                ..Default::default()
-            };
-        }
-        let Some(group_hashes) = cache_group_hashes(tokens, &catalog, lora_name, cache_namespace)
-        else {
-            return CacheLossRouteObservation {
-                prompt_tokens,
-                incomplete_reason: Some("unsupported_cache_group_shape"),
-                ..Default::default()
-            };
-        };
 
         let freshness = update_freshness_metrics(&self.freshness, &self.metrics);
         if freshness != EvidenceFreshnessStatus::BoundedFresh {
@@ -1166,6 +1189,7 @@ impl CacheEvidenceSubscription {
             };
         }
 
+        let ledger_started = Instant::now();
         let ledger = self.ledger.lock();
         if !ledger.expected_owners_match(&expected_owners) {
             return CacheLossRouteObservation {
@@ -1178,6 +1202,9 @@ impl CacheEvidenceSubscription {
         let physical = ledger.resident_prefix_anywhere(&group_hashes, max_hit_tokens);
         let selected_physical = ledger.resident_prefix_on(&group_hashes, max_hit_tokens, owner);
         self.metrics.update_state(ledger.stats());
+        drop(ledger);
+        self.metrics
+            .observe_route_snapshot("ledger", ledger_started.elapsed());
         let (
             KnownPrefixLength::Known(reusable),
             KnownPrefixLength::Known(physical),
@@ -1194,32 +1221,37 @@ impl CacheEvidenceSubscription {
                 ..Default::default()
             };
         };
-        // A recent ordered watermark bounds subscriber lag, but it is not a route-time
-        // barrier. A mutation may occur after the watermark and remain queued while this
-        // snapshot is taken. Emit a separately labeled operational funnel; only a future
-        // ordered route-time cut may use CacheEvidenceQuality::Exact.
-        let relevant_hashes = group_hashes
-            .iter()
-            .flat_map(|group| group.sequence_hashes.iter().copied())
-            .collect();
-        let (barrier, command) = barriers.begin(relevant_hashes);
-        match barrier.outcome() {
-            BarrierOutcome::Incomplete("barrier_missing_capability") => {
-                self.metrics
-                    .observe_barrier_incomplete("missing_capability");
-            }
-            BarrierOutcome::Incomplete("barrier_journal_overflow") => {
-                self.metrics.observe_barrier_incomplete("journal_overflow");
-            }
-            _ => {}
-        }
-        self.metrics.update_barrier_pending(barriers.pending);
-        if let Some(barrier_id) = command
-            && self.barrier_tx.send(barrier_id).is_err()
-        {
-            barriers.fail_round(barrier_id, "barrier_coordinator_closed");
-            self.metrics.update_barrier_pending(barriers.pending);
-        }
+        // Full-volume observations use recent ordered watermarks. Sparse barriers
+        // audit the bounded result without pausing every worker for every request.
+        let barrier =
+            take_exact_sample(&self.exact_sample_counter, self.exact_sample_every).then(|| {
+                self.metrics.observe_exact_audit_requested();
+                let relevant_hashes = group_hashes
+                    .iter()
+                    .flat_map(|group| group.sequence_hashes.iter().copied())
+                    .collect();
+                let (barrier, command) = barriers.begin(relevant_hashes);
+                match barrier.outcome() {
+                    BarrierOutcome::Incomplete("barrier_missing_capability") => {
+                        self.metrics
+                            .observe_barrier_incomplete("missing_capability");
+                    }
+                    BarrierOutcome::Incomplete("barrier_journal_overflow") => {
+                        self.metrics.observe_barrier_incomplete("journal_overflow");
+                    }
+                    _ => {}
+                }
+                self.metrics.update_barrier_pending(barriers.pending);
+                if let Some(barrier_id) = command
+                    && self.barrier_tx.send(barrier_id).is_err()
+                {
+                    barriers.fail_round(barrier_id, "barrier_coordinator_closed");
+                    self.metrics.update_barrier_pending(barriers.pending);
+                }
+                barrier
+            });
+        self.metrics
+            .observe_route_snapshot("total", snapshot_started.elapsed());
         CacheLossRouteObservation {
             prompt_tokens,
             reusable_prefix_tokens: Some(reusable),
@@ -1230,7 +1262,7 @@ impl CacheEvidenceSubscription {
             quality: CacheEvidenceQuality::BoundedPhysical,
             complete: true,
             incomplete_reason: None,
-            barrier: Some(barrier),
+            barrier,
         }
     }
 
@@ -1541,6 +1573,11 @@ pub async fn start_cache_evidence_subscriber(
     let barriers = Arc::new(Mutex::new(BarrierCoordinator::new(
         barrier_pending_capacity(),
     )));
+    let exact_sample_every = exact_sample_every();
+    tracing::info!(
+        exact_sample_every,
+        "Cache-loss full-volume bounded evidence enabled with sampled exact audits"
+    );
     let cold_epoch = Arc::new(Mutex::new(ColdEpochCoordinator::default()));
     let cold_epoch_enabled = std::env::var(CACHE_LOSS_COLD_EPOCH_SINGLE_FRONTEND_ENV)
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
@@ -1601,6 +1638,8 @@ pub async fn start_cache_evidence_subscriber(
         dispatch_gate,
         dispatch_fence,
         barrier_tx,
+        exact_sample_every,
+        exact_sample_counter: AtomicU64::new(0),
         cancel,
         task,
         barrier_task,
@@ -3193,6 +3232,17 @@ mod tests {
     }
 
     #[test]
+    fn exact_audits_are_deterministically_sampled() {
+        let counter = AtomicU64::new(0);
+        assert!(!take_exact_sample(&counter, 3));
+        assert!(!take_exact_sample(&counter, 3));
+        assert!(take_exact_sample(&counter, 3));
+        assert!(!take_exact_sample(&counter, 3));
+        assert!(!take_exact_sample(&counter, 0));
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
     fn old_watermark_becomes_stale() {
         let owner = CacheOwner {
             worker_id: 7,
@@ -3328,7 +3378,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_incomplete_is_applied_before_first_streamed_observation() {
+    fn failed_exact_audit_retains_bounded_observation() {
         let mut missing = BarrierCoordinator::new(8);
         let (missing_ticket, _) = missing.begin(HashSet::from([41]));
 
@@ -3344,17 +3394,12 @@ mod tests {
         let (mutation_ticket, _) = mutation.begin(HashSet::from([41]));
         mutation.mutation(barrier_owner(7), &HashSet::from([41]), false);
 
-        for (ticket, reason) in [
-            (missing_ticket, "barrier_missing_capability"),
-            (control_ticket, "barrier_control_failed"),
-            (gap_ticket, "barrier_gap"),
-            (mutation_ticket, "barrier_relevant_mutation"),
-        ] {
+        for ticket in [missing_ticket, control_ticket, gap_ticket, mutation_ticket] {
             let mut route = provisional_route(ticket);
             assert!(route.finalize_barrier_if_ready());
-            assert_eq!(route.quality, CacheEvidenceQuality::Incomplete);
-            assert!(!route.complete);
-            assert_eq!(route.incomplete_reason, Some(reason));
+            assert_eq!(route.quality, CacheEvidenceQuality::BoundedPhysical);
+            assert!(route.complete);
+            assert_eq!(route.incomplete_reason, None);
             assert!(route.barrier.is_none());
         }
     }
