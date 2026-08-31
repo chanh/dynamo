@@ -304,6 +304,7 @@ where
     cache_loss_recorded: bool,
     cache_history: Arc<Mutex<CacheHistory>>,
     cache_history_request: Option<CacheHistoryRequest>,
+    cache_history_verified: bool,
 }
 
 impl<Sel> RequestGuard<Sel>
@@ -353,6 +354,7 @@ where
             cache_loss_recorded: false,
             cache_history,
             cache_history_request: scheduler_tracked.then_some(cache_history_request),
+            cache_history_verified: false,
         }
     }
 
@@ -497,6 +499,7 @@ where
                 stats.capacity_bytes,
                 stats.capacity_blocks,
             );
+            self.cache_history_verified = true;
         }
         self.cache_loss_recorded = true;
     }
@@ -512,6 +515,9 @@ where
     }
 
     fn finalize_cache_history(&mut self) {
+        if !self.cache_history_verified {
+            return;
+        }
         let Some(history_request) = self.cache_history_request.as_mut() else {
             return;
         };
