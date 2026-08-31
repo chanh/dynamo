@@ -843,6 +843,7 @@ pub struct RouterRequestMetrics {
     pub non_max_overlap_selections_total: IntCounterVec,
     pub overlap_blocks_lost: HistogramVec,
     pub avoidable_prefill_tokens_total: IntCounterVec,
+    pub cache_loss_observation_input_tokens_total: prometheus::IntCounter,
     pub cache_loss_funnel_tokens_total: IntCounterVec,
     pub cache_loss_observations_total: IntCounterVec,
 }
@@ -999,6 +1000,13 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_cache_loss_funnel_tokens_total");
+                let cache_loss_observation_input_tokens_total = metrics
+                    .create_intcounter(
+                        &router_metric("cache_loss_observation_input_tokens_total"),
+                        "Prompt tokens observed by cache-loss accounting, including incomplete outcomes",
+                        extra_labels,
+                    )
+                    .expect("failed to create router_cache_loss_observation_input_tokens_total");
                 let cache_loss_observations_total = metrics
                     .create_intcountervec(
                         &router_metric("cache_loss_observations_total"),
@@ -1026,6 +1034,7 @@ impl RouterRequestMetrics {
                     non_max_overlap_selections_total,
                     overlap_blocks_lost,
                     avoidable_prefill_tokens_total,
+                    cache_loss_observation_input_tokens_total,
                     cache_loss_funnel_tokens_total,
                     cache_loss_observations_total,
                 })
@@ -1053,13 +1062,12 @@ impl RouterRequestMetrics {
     }
 
     pub fn observe_cache_loss_input(&self, prompt_tokens: u64) {
-        self.cache_loss_funnel_tokens_total
-            .with_label_values(&["f0"])
+        self.cache_loss_observation_input_tokens_total
             .inc_by(prompt_tokens);
     }
 
-    pub fn observe_cache_loss_funnel(&self, stages_after_input: [u64; 4]) {
-        for (stage, tokens) in ["f1", "f2", "f3", "f4"].into_iter().zip(stages_after_input) {
+    pub fn observe_cache_loss_funnel(&self, stages: [u64; 5]) {
+        for (stage, tokens) in ["f0", "f1", "f2", "f3", "f4"].into_iter().zip(stages) {
             self.cache_loss_funnel_tokens_total
                 .with_label_values(&[stage])
                 .inc_by(tokens);

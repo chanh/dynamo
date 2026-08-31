@@ -466,7 +466,7 @@ where
             .min(f3);
         self.observability
             .request_metrics()
-            .observe_cache_loss_funnel([f1, f2, f3, f4]);
+            .observe_cache_loss_funnel([route.prompt_tokens, f1, f2, f3, f4]);
         self.cache_loss_recorded = true;
     }
 
