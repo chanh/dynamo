@@ -32,6 +32,7 @@ pub(super) struct WorkerSelection {
     pub(super) overlap_amount: u32,
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
+    pub(super) max_cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) router_hint: Option<RouterHint>,
 }
@@ -117,6 +118,7 @@ where
                 overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                max_cached_tokens,
                 potential_decode_blocks: _,
                 routing_hashes,
                 router_hint,
@@ -125,6 +127,7 @@ where
                 overlap_amount: overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                max_cached_tokens,
                 routing_hashes,
                 router_hint,
             }),
