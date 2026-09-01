@@ -55,6 +55,7 @@ pub use dynamo_kv_router::selector;
 pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
+mod minimal_cache_loss;
 pub mod prefill_router;
 pub mod publisher;
 mod request_lease;
@@ -350,6 +351,7 @@ pub enum FindBestMatchOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        max_cached_tokens: usize,
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         router_hint: Option<RouterHint>,
@@ -369,6 +371,7 @@ pub enum FindBestMatchAdvisoryOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        max_cached_tokens: usize,
         potential_decode_blocks: u64,
         selected_worker_load: scheduling::AdvisoryWorkerLoad,
         routing_hashes: Option<RoutingDecisionHashes>,
@@ -1723,6 +1726,7 @@ where
                     overlap_blocks: response.effective_overlap_blocks.round() as u32,
                     effective_overlap_blocks: response.effective_overlap_blocks,
                     cached_tokens: response.cached_tokens,
+                    max_cached_tokens: response.max_cached_tokens,
                     potential_decode_blocks: response.potential_decode_blocks as u64,
                     selected_worker_load: selected_worker_load
                         .expect("without-admission selection returns advisory load"),
@@ -2565,6 +2569,7 @@ mod tests {
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,
                 cached_tokens: 0,
+                max_cached_tokens: 0,
                 potential_decode_blocks: request
                     .worker_load_for(self.selected_worker)
                     .potential_decode_blocks()
