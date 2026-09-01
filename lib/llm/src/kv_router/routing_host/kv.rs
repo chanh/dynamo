@@ -327,6 +327,7 @@ where
                 self.request_metrics.clone(),
                 cleanup,
                 request,
+                !is_query_only,
                 CacheLossTracking::new(
                     cache_loss,
                     Arc::clone(cache_history),

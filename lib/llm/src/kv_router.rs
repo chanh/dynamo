@@ -1713,6 +1713,7 @@ where
                         overlap_blocks: response.effective_overlap_blocks.round() as u32,
                         effective_overlap_blocks: response.effective_overlap_blocks,
                         cached_tokens: response.cached_tokens,
+                        max_cached_tokens: response.max_cached_tokens,
                         potential_decode_blocks: response.potential_decode_blocks as u64,
                         routing_hashes,
                         router_hint,

@@ -624,6 +624,7 @@ where
             request_metrics,
             KvRequestCleanup::new(chooser, context_id, worker, attempt),
             request,
+            scheduler_tracked,
             cache_loss_tracking,
         )
     }
@@ -632,6 +633,7 @@ where
         request_metrics: Arc<RouterRequestMetrics>,
         cleanup: KvRequestCleanup<Sel>,
         request: &PreprocessedRequest,
+        scheduler_tracked: bool,
         cache_loss_tracking: CacheLossTracking,
     ) -> Self {
         let chooser = &cleanup.chooser;
@@ -812,7 +814,7 @@ where
                 self.approximate_lru.as_ref(),
             )
             && let Some(materialized) =
-            output_hashes.observe(data.index.unwrap_or(0), &data.token_ids)
+                output_hashes.observe(data.index.unwrap_or(0), &data.token_ids)
             && let Err(error) = lease.materialize(
                 materialized.parent_hash,
                 materialized.blocks,
