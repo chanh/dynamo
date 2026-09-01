@@ -91,6 +91,7 @@ fn selection(worker_id: u64) -> WorkerSelectionResult {
         cached_tokens: 0,
         max_cached_tokens: 0,
         potential_decode_blocks: 0,
+        decision_trace: None,
     }
 }
 
