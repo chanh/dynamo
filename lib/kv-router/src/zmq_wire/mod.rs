@@ -13,7 +13,9 @@ use std::sync::atomic::AtomicU32;
 use rmp_serde as rmps;
 use rustc_hash::FxHashMap;
 
-use crate::protocols::{DpRank, PlacementEvent, StorageTier, WorkerWithDpRank};
+use crate::protocols::{
+    DpRank, KvCacheEventData, KvCacheStoredBlockData, PlacementEvent, StorageTier, WorkerWithDpRank,
+};
 
 mod convert;
 mod deserialize;
@@ -34,6 +36,7 @@ pub use types::{
     BlockHashValue, ExtraKeyItem, KvEventBatch, KvEventOwnership, KvTokenIds, Locality, RawKvEvent,
 };
 
+use convert::convert_event_with_resolved_blocks;
 use filter::KvCacheEventMetadata;
 
 pub fn decode_event_batch(payload: &[u8]) -> Result<KvEventBatch, rmps::decode::Error> {
@@ -50,6 +53,18 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    /// CPU offload events are hash-only. Keep a bounded, per-worker mapping
+    /// from their GPU-origin external hash to the canonical block identity.
+    /// This is routing metadata, not request content.
+    cpu_hash_mappings: FxHashMap<(WorkerWithDpRank, u64), CpuHashMapping>,
+}
+
+const MAX_CPU_HASH_MAPPINGS: usize = 4_000_000;
+
+#[derive(Debug, Clone, PartialEq)]
+enum CpuHashMapping {
+    Known(KvCacheStoredBlockData),
+    Ambiguous,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +118,7 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            cpu_hash_mappings: FxHashMap::default(),
         }
     }
 
@@ -113,6 +129,7 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
+            cpu_hash_mappings: FxHashMap::default(),
         }
     }
 
@@ -200,19 +217,23 @@ impl ZmqEventNormalizer {
     }
 
     pub fn normalize_preprocessed(
-        &self,
+        &mut self,
         raw: RawKvEvent,
         event_id: u64,
         worker: WorkerWithDpRank,
     ) -> Option<PlacementEvent> {
-        convert_event(
+        let resolved_cpu_blocks = self.resolve_cpu_blocks(&raw, worker);
+        let event = convert_event_with_resolved_blocks(
             raw,
             event_id,
             self.kv_block_size,
             worker,
             &self.warning_count,
             self.image_token_id,
-        )
+            resolved_cpu_blocks,
+        );
+        self.learn_cpu_mapping(&event, worker);
+        event
     }
 
     pub fn normalize(
@@ -223,6 +244,78 @@ impl ZmqEventNormalizer {
     ) -> Option<PlacementEvent> {
         let raw = self.preprocess(raw, worker)?;
         self.normalize_preprocessed(raw, event_id, worker)
+    }
+
+    fn resolve_cpu_blocks(
+        &mut self,
+        raw: &RawKvEvent,
+        worker: WorkerWithDpRank,
+    ) -> Option<Vec<KvCacheStoredBlockData>> {
+        let RawKvEvent::BlockStored {
+            block_hashes,
+            token_ids,
+            block_size,
+            medium,
+            ..
+        } = raw
+        else {
+            if matches!(raw, RawKvEvent::AllBlocksCleared { .. }) {
+                self.cpu_hash_mappings
+                    .retain(|(owner, _), _| *owner != worker);
+            }
+            return None;
+        };
+        if StorageTier::from_kv_medium(medium.as_deref()?) != Some(StorageTier::HostPinned)
+            || !token_ids.is_empty()
+            || *block_size != 0
+        {
+            return None;
+        }
+        let mut blocks = Vec::with_capacity(block_hashes.len());
+        for external_hash in block_hashes {
+            let key = (worker, external_hash.into_u64());
+            match self.cpu_hash_mappings.get(&key) {
+                Some(CpuHashMapping::Known(block)) => blocks.push(block.clone()),
+                Some(CpuHashMapping::Ambiguous) | None => {
+                    tracing::debug!(
+                        worker_id = worker.worker_id,
+                        "CPU cache event has no unambiguous GPU origin"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(blocks)
+    }
+
+    fn learn_cpu_mapping(&mut self, event: &Option<PlacementEvent>, worker: WorkerWithDpRank) {
+        let Some(event) = event else { return };
+        if event.placement.tier != StorageTier::Device {
+            return;
+        }
+        let KvCacheEventData::Stored(stored) = &event.event.data else {
+            return;
+        };
+        for block in &stored.blocks {
+            let key = (worker, block.block_hash.0);
+            match self.cpu_hash_mappings.get(&key) {
+                Some(CpuHashMapping::Known(previous)) if previous != block => {
+                    self.cpu_hash_mappings
+                        .insert(key, CpuHashMapping::Ambiguous);
+                }
+                Some(_) => {}
+                None if self.cpu_hash_mappings.len() < MAX_CPU_HASH_MAPPINGS => {
+                    self.cpu_hash_mappings
+                        .insert(key, CpuHashMapping::Known(block.clone()));
+                }
+                None => {
+                    tracing::warn!(
+                        "CPU cache hash mapping is full; preserving conservative misses"
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     fn learn_metadata(&mut self, metadata: KvCacheEventMetadata, dp_rank: DpRank) {

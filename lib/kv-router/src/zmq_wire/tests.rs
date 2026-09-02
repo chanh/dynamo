@@ -1078,6 +1078,50 @@ fn cpu_event_with_full_payload_is_indexable() {
     assert_eq!(warning_count.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn hash_only_cpu_store_reuses_the_same_worker_gpu_identity() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+    let gpu = RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(201)],
+        parent_block_hash: None,
+        token_ids: vec![10, 11, 12, 13],
+        block_size: 4,
+        medium: Some("GPU".to_string()),
+        lora_name: None,
+        cache_namespace: None,
+        block_mm_infos: None,
+        is_eagle: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+    };
+    let gpu = normalizer.normalize(gpu, 1, worker).unwrap();
+    let gpu_block = match gpu.event.data {
+        KvCacheEventData::Stored(store) => store.blocks.into_iter().next().unwrap(),
+        other => panic!("expected GPU store, got {other:?}"),
+    };
+
+    let cpu = normalizer
+        .normalize(
+            cpu_block_stored(CpuBlockStoredFixture {
+                block_hashes: &[201],
+                token_ids: &[],
+                block_size: 0,
+                parent_block_hash: None,
+            }),
+            2,
+            worker,
+        )
+        .unwrap();
+    match cpu.event.data {
+        KvCacheEventData::Stored(store) => assert_eq!(store.blocks, vec![gpu_block]),
+        other => panic!("expected resolved CPU store, got {other:?}"),
+    }
+}
+
 // ---- locality decode + storage-tier gating (this PR) ----
 
 /// LOCAL/REMOTE decode to their variants, any other string folds into

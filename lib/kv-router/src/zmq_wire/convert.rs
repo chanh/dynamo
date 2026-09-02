@@ -22,6 +22,30 @@ pub fn convert_event(
     warning_count: &Arc<AtomicU32>,
     image_token_id: Option<u32>,
 ) -> Option<PlacementEvent> {
+    convert_event_with_resolved_blocks(
+        raw,
+        event_id,
+        kv_block_size,
+        worker,
+        warning_count,
+        image_token_id,
+        None,
+    )
+}
+
+/// Convert a wire event, optionally using canonical blocks resolved from a
+/// prior GPU event. CPU offload stores intentionally contain no token IDs, so
+/// their external hashes alone are not enough to reconstruct a radix key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_event_with_resolved_blocks(
+    raw: RawKvEvent,
+    event_id: u64,
+    kv_block_size: u32,
+    worker: WorkerWithDpRank,
+    warning_count: &Arc<AtomicU32>,
+    image_token_id: Option<u32>,
+    resolved_blocks: Option<Vec<KvCacheStoredBlockData>>,
+) -> Option<PlacementEvent> {
     // Read the wire tier/locality facts up front, before any indexing work.
     let (medium, locality) = match &raw {
         RawKvEvent::BlockStored {
@@ -115,6 +139,28 @@ pub fn convert_event(
                 .into_iter()
                 .map(BlockHashValue::into_u64)
                 .collect();
+            let resolved_cpu_blocks = resolved_blocks.is_some();
+            let blocks = resolved_blocks.unwrap_or_else(|| {
+                create_stored_blocks(
+                    kv_block_size,
+                    &token_ids,
+                    &num_block_tokens,
+                    &block_hashes_u64,
+                    lora_name.as_deref(),
+                    cache_namespace.as_deref(),
+                    warning_count,
+                    block_mm_infos.as_deref(),
+                    is_eagle,
+                    image_token_id,
+                )
+            });
+            if resolved_cpu_blocks && blocks.len() != block_hashes_u64.len() {
+                tracing::warn!(
+                    event_id,
+                    "Resolved CPU cache blocks did not match the wire event"
+                );
+                return None;
+            }
             KvCacheEvent {
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
@@ -122,18 +168,7 @@ pub fn convert_event(
                         .map(BlockHashValue::into_u64)
                         .map(ExternalSequenceBlockHash::from),
                     start_position: None,
-                    blocks: create_stored_blocks(
-                        kv_block_size,
-                        &token_ids,
-                        &num_block_tokens,
-                        &block_hashes_u64,
-                        lora_name.as_deref(),
-                        cache_namespace.as_deref(),
-                        warning_count,
-                        block_mm_infos.as_deref(),
-                        is_eagle,
-                        image_token_id,
-                    ),
+                    blocks,
                 }),
                 dp_rank,
             }
