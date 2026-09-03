@@ -610,6 +610,7 @@ impl<Sel> RequestGuard<Sel>
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
+    #[allow(clippy::too_many_arguments)] // Cache-loss state must stay request-scoped.
     pub(super) fn new_kv(
         chooser: Arc<KvRouter<Sel>>,
         request_metrics: Arc<RouterRequestMetrics>,

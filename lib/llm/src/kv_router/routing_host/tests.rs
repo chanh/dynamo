@@ -54,6 +54,19 @@ fn request() -> PreprocessedRequest {
         .unwrap()
 }
 
+fn untracked_cache_loss_tracking() -> CacheLossTracking {
+    CacheLossTracking::new(
+        RouteObservation {
+            prompt_tokens: 0,
+            previously_computed_tokens: 0,
+            best_router_tokens: 0,
+            selected_router_tokens: 0,
+        },
+        Arc::new(parking_lot::Mutex::new(CacheHistory::new(1, 1))),
+        CacheHistoryRequest::new(vec![], None, None, None, 1, false),
+    )
+}
+
 async fn test_load_context(client: &Client) -> Arc<RoutingLoadContext> {
     RoutingLoadContext::start(
         client.clone(),
@@ -777,6 +790,8 @@ async fn shutdown_cancellation_drains_trailing_engine_shutdown_error() {
         WorkerWithDpRank::from_worker_id(0),
         dynamo_kv_router::scheduling::AdmissionAttempt::Untracked,
         &request(),
+        false,
+        untracked_cache_loss_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -823,6 +838,8 @@ async fn client_cancellation_still_ends_stream_without_draining() {
         WorkerWithDpRank::from_worker_id(0),
         dynamo_kv_router::scheduling::AdmissionAttempt::Untracked,
         &request(),
+        false,
+        untracked_cache_loss_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -861,6 +878,8 @@ async fn drain_without_trailing_error_gives_up_at_the_deadline() {
         WorkerWithDpRank::from_worker_id(0),
         dynamo_kv_router::scheduling::AdmissionAttempt::Untracked,
         &request(),
+        false,
+        untracked_cache_loss_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -916,6 +935,8 @@ async fn trailing_error_within_the_drain_window_still_reaches_migration() {
         WorkerWithDpRank::from_worker_id(0),
         dynamo_kv_router::scheduling::AdmissionAttempt::Untracked,
         &request(),
+        false,
+        untracked_cache_loss_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
@@ -962,6 +983,8 @@ async fn always_ready_terminals_cannot_starve_the_drain_deadline() {
         WorkerWithDpRank::from_worker_id(0),
         dynamo_kv_router::scheduling::AdmissionAttempt::Untracked,
         &request(),
+        false,
+        untracked_cache_loss_tracking(),
     );
     let monitored = monitor_response_stream(source, context, guard);
     tokio::pin!(monitored);
