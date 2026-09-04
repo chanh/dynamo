@@ -17,4 +17,5 @@ simple-filter-score-pick-policy = { package = "dynamo-custom-policy-example-simp
 disagg-filter-score-pick-policy = { package = "dynamo-custom-policy-example-disagg-filter-score-pick", path = "../disagg-filter-score-pick" }
 simple-stacked-score-pick-policy = { package = "dynamo-custom-policy-example-simple-stacked-score-pick", path = "../simple-stacked-score-pick" }
 cache-affinity-budget-policy = { package = "dynamo-custom-policy-example-cache-affinity-budget", path = "../cache-affinity-budget" }
+longest-cache-reuse-policy = { package = "dynamo-custom-policy-example-longest-cache-reuse", path = "../longest-cache-reuse" }
 dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }

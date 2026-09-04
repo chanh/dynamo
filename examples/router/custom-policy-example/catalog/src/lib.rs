@@ -15,7 +15,8 @@ pub fn register(
     simple_filter_score_pick_policy::register(registry)?;
     disagg_filter_score_pick_policy::register(registry)?;
     simple_stacked_score_pick_policy::register(registry)?;
-    cache_affinity_budget_policy::register(registry)
+    cache_affinity_budget_policy::register(registry)?;
+    longest_cache_reuse_policy::register(registry)
 }
 
 #[cfg(test)]
@@ -46,6 +47,10 @@ mod tests {
         assert!(matches!(
             cache_affinity_budget_policy::register(&mut registry),
             Err(WorkerSelectionPolicyRegistryError::Duplicate { name }) if name == "cache-affinity-budget"
+        ));
+        assert!(matches!(
+            longest_cache_reuse_policy::register(&mut registry),
+            Err(WorkerSelectionPolicyRegistryError::Duplicate { name }) if name == "longest-cache-reuse"
         ));
     }
 }
