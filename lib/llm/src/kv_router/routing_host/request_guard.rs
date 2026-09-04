@@ -707,7 +707,7 @@ where
             migration_state: request.migration_state.clone(),
             cache_loss: None,
             cache_loss_recorded: false,
-            cache_history: Arc::new(Mutex::new(CacheHistory::new(1, 1))),
+            cache_history: Arc::new(Mutex::new(CacheHistory::new(32, 1))),
             cache_history_request: None,
             cache_history_verified: false,
             _lora_load: lora_load,
@@ -922,7 +922,8 @@ where
                 stats.represented_tokens,
                 stats.estimated_retained_bytes,
                 stats.capacity_bytes,
-                stats.capacity_blocks,
+                stats.retained_chunks,
+                stats.oldest_chunk_age_seconds,
             );
             self.cache_history_verified = true;
         }
@@ -957,7 +958,8 @@ where
             stats.represented_tokens,
             stats.estimated_retained_bytes,
             stats.capacity_bytes,
-            stats.capacity_blocks,
+            stats.retained_chunks,
+            stats.oldest_chunk_age_seconds,
         );
     }
 }

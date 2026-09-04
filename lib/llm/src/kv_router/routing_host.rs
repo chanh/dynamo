@@ -414,7 +414,8 @@ where
                 stats.represented_tokens,
                 stats.estimated_retained_bytes,
                 stats.capacity_bytes,
-                stats.capacity_blocks,
+                stats.retained_chunks,
+                stats.oldest_chunk_age_seconds,
             );
         }
 
