@@ -77,16 +77,31 @@ mod tests {
     }
 
     fn request(overlaps: [usize; 2], loads: [usize; 2]) -> SchedulingRequest {
+        request_with_effective_overlap(overlaps, overlaps, loads)
+    }
+
+    fn request_with_effective_overlap(
+        device_overlaps: [usize; 2],
+        effective_overlaps: [usize; 2],
+        loads: [usize; 2],
+    ) -> SchedulingRequest {
         let workers = [
             WorkerWithDpRank::from_worker_id(0),
             WorkerWithDpRank::from_worker_id(1),
         ];
         let mut overlap = OverlapSignals::default();
-        for (worker, blocks) in workers.into_iter().zip(overlaps) {
-            overlap.tier_overlap_blocks.device.insert(worker, blocks);
+        for ((worker, device_blocks), effective_blocks) in workers
+            .into_iter()
+            .zip(device_overlaps)
+            .zip(effective_overlaps)
+        {
+            overlap
+                .tier_overlap_blocks
+                .device
+                .insert(worker, device_blocks);
             overlap
                 .effective_overlap_blocks
-                .insert(worker, blocks as f64);
+                .insert(worker, effective_blocks as f64);
         }
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
@@ -143,6 +158,25 @@ mod tests {
         assert_eq!(
             select([80, 79], [1_000_000, 0]),
             WorkerWithDpRank::from_worker_id(0)
+        );
+    }
+
+    #[test]
+    fn greater_effective_reuse_wins_over_device_overlap() {
+        let policy = create_policy(&KvRouterConfig::default(), "test");
+        let workers = HashMap::from([(0, TestWorker), (1, TestWorker)]);
+        let request = request_with_effective_overlap([80, 79], [80, 90], [0, 0]);
+        assert_eq!(
+            policy
+                .select_worker(WorkerSelectionInput::configured(
+                    &workers,
+                    &request,
+                    request.eligibility(),
+                    16,
+                ))
+                .unwrap()
+                .worker,
+            WorkerWithDpRank::from_worker_id(1)
         );
     }
 
