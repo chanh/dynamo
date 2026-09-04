@@ -1,0 +1,9 @@
+# PPC shadow experiment only. This policy is not selected unless the frontend
+# explicitly loads this file.
+worker_selection:
+  aggregated: cache-affinity-budget
+  instances:
+    - name: cache-affinity-budget
+      type: cache-affinity-budget
+      parameters:
+        max_load_cost_delta_blocks: 64

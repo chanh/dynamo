@@ -2095,6 +2095,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-custom-policy-example-cache-affinity-budget"
+version = "1.5.0"
+dependencies = [
+ "dynamo-kv-router",
+ "serde",
+]
+
+[[package]]
+name = "dynamo-custom-policy-example-catalog"
+version = "1.5.0"
+dependencies = [
+ "dynamo-custom-policy-example-cache-affinity-budget",
+ "dynamo-custom-policy-example-disagg-filter-score-pick",
+ "dynamo-custom-policy-example-simple-filter-score-pick",
+ "dynamo-custom-policy-example-simple-stacked-score-pick",
+ "dynamo-custom-policy-example-soft-pin-repin",
+ "dynamo-kv-router",
+]
+
+[[package]]
+name = "dynamo-custom-policy-example-disagg-filter-score-pick"
+version = "1.5.0"
+dependencies = [
+ "dynamo-kv-router",
+ "serde",
+]
+
+[[package]]
+name = "dynamo-custom-policy-example-simple-filter-score-pick"
+version = "1.5.0"
+dependencies = [
+ "dynamo-kv-router",
+ "serde",
+]
+
+[[package]]
+name = "dynamo-custom-policy-example-simple-stacked-score-pick"
+version = "1.5.0"
+dependencies = [
+ "dynamo-kv-router",
+ "serde",
+]
+
+[[package]]
+name = "dynamo-custom-policy-example-soft-pin-repin"
+version = "1.5.0"
+dependencies = [
+ "dynamo-kv-router",
+ "serde",
+]
+
+[[package]]
 name = "dynamo-data-gen"
 version = "1.5.0"
 dependencies = [
@@ -2381,6 +2433,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dynamo-backend-common",
+ "dynamo-custom-policy-example-catalog",
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-mocker",
@@ -2390,7 +2443,6 @@ dependencies = [
  "dynamo-sidecar-common",
  "dynamo-trtllm-sidecar",
  "dynamo-vllm-sidecar",
- "dynamo-worker-selection-policy-catalog",
  "futures",
  "once_cell",
  "opentelemetry",
@@ -2642,13 +2694,6 @@ dependencies = [
  "tonic-build 0.13.1",
  "tonic-health",
  "tracing",
-]
-
-[[package]]
-name = "dynamo-worker-selection-policy-catalog"
-version = "1.5.0"
-dependencies = [
- "dynamo-kv-router",
 ]
 
 [[package]]

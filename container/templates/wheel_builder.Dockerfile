@@ -570,6 +570,7 @@ COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
 COPY lib/ /opt/dynamo/lib/
 COPY components/ /opt/dynamo/components/
+COPY examples/router/custom-policy-example/ /opt/dynamo/examples/router/custom-policy-example/
 
 # Build ai-dynamo (pure Python) and ai-dynamo-runtime (maturin) wheels
 ARG USE_SCCACHE
@@ -593,7 +594,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     cd /opt/dynamo && \
     uv build --wheel --out-dir /opt/dynamo/dist && \
     cd /opt/dynamo/lib/bindings/python && \
-{% if framework == "sglang" %}    maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3" --out /opt/dynamo/dist && \
+{% if framework == "sglang" %}    maturin build --release --features "custom-policy,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3" --out /opt/dynamo/dist && \
 {% else %}    if [ "$ENABLE_MEDIA_FFMPEG" = "true" ]; then \
         # Skip maturin's built-in repair: it would graft the in-tree libav* into the
         # wheel, which the codec gate rejects. Repair with those sonames excluded so
@@ -604,7 +605,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
             arm64) ARCH_ALT=aarch64 ;; \
             *) echo "ERROR: unexpected TARGETARCH='${TARGETARCH}'; cannot pick a manylinux platform tag" >&2; exit 1 ;; \
         esac && \
-        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3" --auditwheel skip --out target/wheels && \
+        maturin build --release --features "custom-policy,media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3" --auditwheel skip --out target/wheels && \
         auditwheel repair \
             --exclude 'libavcodec.so.*' \
             --exclude 'libavdevice.so.*' \
@@ -617,13 +618,12 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
             --wheel-dir /opt/dynamo/dist \
             target/wheels/ai_dynamo_runtime-*.whl; \
     else \
-        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3" --out /opt/dynamo/dist; \
+        maturin build --release --features "custom-policy,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3" --out /opt/dynamo/dist; \
     fi && \
 {% endif %}    /tmp/use-sccache.sh show-stats "Dynamo Runtime"
 
 # Complete the root Cargo workspace after the expensive runtime build. Planner
 # wheel metadata and optional source archival both validate every member.
-COPY examples/router/custom-policy-example/ /opt/dynamo/examples/router/custom-policy-example/
 COPY deploy/inference-gateway/ext-proc/ /opt/dynamo/deploy/inference-gateway/ext-proc/
 
 {% if target == "planner" or (target == "runtime" and framework in ("vllm", "sglang", "trtllm")) %}
