@@ -1137,6 +1137,7 @@ impl RouterRequestMetrics {
             .inc();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_cache_loss_history(
         &self,
         retained_records: usize,
