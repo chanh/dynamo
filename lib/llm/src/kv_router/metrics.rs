@@ -63,13 +63,27 @@ use prometheus::{
 };
 
 use crate::http::service::metrics::generate_log_buckets;
+use crate::kv_router::cache_history::{self, CacheHistoryStats};
 use crate::protocols::common::timing::WORKER_TYPE_PREFILL;
-use dynamo_kv_router::indexer::ApproximateLruStats;
+use dynamo_kv_router::{
+    indexer::ApproximateLruStats, protocols::cache_reuse_worker_stages_enabled,
+};
 
 pub(crate) const ROUTER_WORKER_ID_LABEL: &str = "router_worker_id";
 const TARGET_NAMESPACE_LABEL: &str = "target_namespace";
 const TARGET_COMPONENT_LABEL: &str = "target_component";
 const TARGET_ENDPOINT_LABEL: &str = "target_endpoint";
+const CACHE_REUSE_WORKER_STAGES: [&str; 4] = ["f2", "f3", "f4", "f5"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CacheReuseStagePlan {
+    history: bool,
+    worker: bool,
+}
+
+fn cache_reuse_stage_plan(history: bool, worker: bool) -> Option<CacheReuseStagePlan> {
+    (history || worker).then_some(CacheReuseStagePlan { history, worker })
+}
 
 /// Buckets for CPU-bound compute phases (block hashing, sequence hashing).
 fn compute_overhead_buckets() -> Vec<f64> {
@@ -854,6 +868,27 @@ pub struct RouterRequestMetrics {
     pub shared_cache_beyond_blocks: prometheus::Histogram,
     pub non_max_overlap_selections_total: IntCounterVec,
     pub overlap_blocks_lost: HistogramVec,
+    pub(crate) cache_reuse: Option<CacheReuseMetrics>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CacheReuseMetrics {
+    observation_input_tokens_total: IntCounter,
+    f0_tokens_total: IntCounter,
+    f1_tokens_total: Option<IntCounter>,
+    worker_stage_tokens_total: Option<[IntCounter; CACHE_REUSE_WORKER_STAGES.len()]>,
+    complete_observations_total: IntCounter,
+    incomplete_observations_total: IntCounter,
+    history_gauges: Option<CacheHistoryGauges>,
+}
+
+#[derive(Clone)]
+struct CacheHistoryGauges {
+    retained_entries: IntGauge,
+    represented_tokens: IntGauge,
+    estimated_retained_bytes: IntGauge,
+    capacity_entries: IntGauge,
+    capacity_bytes: IntGauge,
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -989,6 +1024,85 @@ impl RouterRequestMetrics {
                     .expect("failed to create router_overlap_blocks_lost");
                 non_max_overlap_selections_total.with_label_values(&[WORKER_TYPE_PREFILL]);
                 overlap_blocks_lost.with_label_values(&[WORKER_TYPE_PREFILL]);
+                let cache_reuse = cache_reuse_stage_plan(
+                    cache_history::enabled(),
+                    cache_reuse_worker_stages_enabled(),
+                )
+                .map(|plan| {
+                    let observation_input_tokens_total = metrics
+                        .create_intcounter(
+                            &router_metric("cache_loss_observation_input_tokens_total"),
+                            "Prompt tokens observed by cache-reuse accounting, including incomplete outcomes",
+                            extra_labels,
+                        )
+                        .expect(
+                            "failed to create router_cache_loss_observation_input_tokens_total",
+                        );
+                    let funnel_tokens_total = metrics
+                        .create_intcountervec(
+                            &router_metric("cache_loss_funnel_tokens_total"),
+                            "Raw token observations at each cache-reuse stage; later stages may exceed earlier stages",
+                            &["stage"],
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_funnel_tokens_total");
+                    let f0_tokens_total = funnel_tokens_total.with_label_values(&["f0"]);
+                    let f1_tokens_total = plan
+                        .history
+                        .then(|| funnel_tokens_total.with_label_values(&["f1"]));
+                    let worker_stage_tokens_total = plan.worker.then(|| {
+                        CACHE_REUSE_WORKER_STAGES
+                            .map(|stage| funnel_tokens_total.with_label_values(&[stage]))
+                    });
+                    let observations_total = metrics
+                        .create_intcountervec(
+                            &router_metric("cache_loss_observations_total"),
+                            "Cache-reuse observations by completion status",
+                            &["result"],
+                            extra_labels,
+                        )
+                        .expect("failed to create router_cache_loss_observations_total");
+                    let complete_observations_total =
+                        observations_total.with_label_values(&["complete"]);
+                    let incomplete_observations_total =
+                        observations_total.with_label_values(&["incomplete"]);
+                    let gauge = |suffix, help| {
+                        metrics
+                            .create_intgauge(&router_metric(suffix), help, extra_labels)
+                            .unwrap_or_else(|error| panic!("failed to create {suffix}: {error}"))
+                    };
+                    let history_gauges = plan.history.then(|| CacheHistoryGauges {
+                        retained_entries: gauge(
+                            "cache_loss_history_unique_hashes",
+                            "Distinct canonical block hashes retained by cache history",
+                        ),
+                        represented_tokens: gauge(
+                            "cache_loss_history_represented_tokens",
+                            "Tokens represented by distinct cache-history entries",
+                        ),
+                        estimated_retained_bytes: gauge(
+                            "cache_loss_history_estimated_bytes",
+                            "Estimated bytes used by retained cache-history entries",
+                        ),
+                        capacity_entries: gauge(
+                            "cache_loss_history_capacity_blocks",
+                            "Configured distinct-block capacity of cache history",
+                        ),
+                        capacity_bytes: gauge(
+                            "cache_loss_history_capacity_bytes",
+                            "Configured byte budget of cache history",
+                        ),
+                    });
+                    CacheReuseMetrics {
+                        observation_input_tokens_total,
+                        f0_tokens_total,
+                        f1_tokens_total,
+                        worker_stage_tokens_total,
+                        complete_observations_total,
+                        incomplete_observations_total,
+                        history_gauges,
+                    }
+                });
                 Arc::new(Self {
                     requests_total,
                     time_to_first_token_seconds,
@@ -1001,6 +1115,7 @@ impl RouterRequestMetrics {
                     shared_cache_beyond_blocks,
                     non_max_overlap_selections_total,
                     overlap_blocks_lost,
+                    cache_reuse,
                 })
             })
             .clone()
@@ -1015,6 +1130,71 @@ impl RouterRequestMetrics {
         self.overlap_blocks_lost
             .with_label_values(&[worker_type])
             .observe(overlap_blocks_lost);
+    }
+
+    pub(crate) fn observe_cache_reuse_input(&self, prompt_tokens: u64) {
+        if let Some(metrics) = &self.cache_reuse {
+            metrics.observation_input_tokens_total.inc_by(prompt_tokens);
+        }
+    }
+
+    pub(crate) fn observe_cache_reuse_complete(
+        &self,
+        prompt_tokens: u64,
+        previously_seen_tokens: Option<u64>,
+        worker_stages: Option<[u64; CACHE_REUSE_WORKER_STAGES.len()]>,
+    ) {
+        let Some(metrics) = &self.cache_reuse else {
+            return;
+        };
+        metrics.f0_tokens_total.inc_by(prompt_tokens);
+        if let (Some(counter), Some(tokens)) = (&metrics.f1_tokens_total, previously_seen_tokens) {
+            counter.inc_by(tokens);
+        }
+        if let (Some(counters), Some(stages)) = (&metrics.worker_stage_tokens_total, worker_stages)
+        {
+            for (counter, tokens) in counters.iter().zip(stages) {
+                counter.inc_by(tokens);
+            }
+        }
+        metrics.complete_observations_total.inc();
+    }
+
+    pub(crate) fn observe_cache_reuse_incomplete(&self) {
+        if let Some(metrics) = &self.cache_reuse {
+            metrics.incomplete_observations_total.inc();
+        }
+    }
+
+    pub(crate) fn set_cache_history_capacity(&self, stats: CacheHistoryStats) {
+        let Some(metrics) = self
+            .cache_reuse
+            .as_ref()
+            .and_then(|metrics| metrics.history_gauges.as_ref())
+        else {
+            return;
+        };
+        let gauge = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        metrics.capacity_entries.set(gauge(stats.capacity_entries));
+        metrics.capacity_bytes.set(gauge(stats.capacity_bytes));
+    }
+
+    pub(crate) fn set_cache_history_retained(&self, stats: CacheHistoryStats) {
+        let Some(metrics) = self
+            .cache_reuse
+            .as_ref()
+            .and_then(|metrics| metrics.history_gauges.as_ref())
+        else {
+            return;
+        };
+        let gauge = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        metrics.retained_entries.set(gauge(stats.retained_entries));
+        metrics
+            .represented_tokens
+            .set(i64::try_from(stats.represented_tokens).unwrap_or(i64::MAX));
+        metrics
+            .estimated_retained_bytes
+            .set(gauge(stats.estimated_retained_bytes));
     }
 }
 
@@ -1253,6 +1433,32 @@ impl RemoteIndexerMetrics {
 mod tests {
     use super::*;
     use prometheus::{Encoder, TextEncoder};
+
+    #[test]
+    fn cache_reuse_stage_plan_covers_all_flag_combinations() {
+        assert_eq!(cache_reuse_stage_plan(false, false), None);
+        assert_eq!(
+            cache_reuse_stage_plan(true, false),
+            Some(CacheReuseStagePlan {
+                history: true,
+                worker: false,
+            })
+        );
+        assert_eq!(
+            cache_reuse_stage_plan(false, true),
+            Some(CacheReuseStagePlan {
+                history: false,
+                worker: true,
+            })
+        );
+        assert_eq!(
+            cache_reuse_stage_plan(true, true),
+            Some(CacheReuseStagePlan {
+                history: true,
+                worker: true,
+            })
+        );
+    }
 
     fn gather_pef(registry: &prometheus::Registry) -> String {
         let encoder = TextEncoder::new();

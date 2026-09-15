@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::kv_router::{FindBestMatchAdmission, routing_host::kv_selection::SelectionOutcome};
+use crate::kv_router::{
+    FindBestMatchAdmission,
+    routing_host::{
+        kv_selection::SelectionOutcome,
+        request_guard::{CacheLossTracking, RouteObservation},
+    },
+};
 
 impl<Sel> RoutingHost<Sel>
 where
@@ -340,10 +346,37 @@ where
         let chooser = self.kv_router();
         let block_size = chooser.block_size() as usize;
         let selected_worker = selection.worker;
-        let mut guard = match cleanup {
-            Some(cleanup) => {
-                RequestGuard::new_kv_with_cleanup(self.request_metrics.clone(), cleanup, request)
+        let history_prompt_hashes = self.cache_history.as_ref().and_then(|_| {
+            if chooser.indexer().records_routing_decisions() {
+                selection
+                    .routing_hashes
+                    .as_ref()
+                    .map(|hashes| hashes.sequence_hashes.clone())
+            } else {
+                selection
+                    .routing_hashes
+                    .take()
+                    .map(|hashes| hashes.sequence_hashes)
             }
+        });
+        let cache_loss_tracking = if !is_query_only && self.cache_reuse_worker_stages_enabled {
+            selection.max_cached_tokens.map(|max_cached_tokens| {
+                CacheLossTracking::new(RouteObservation {
+                    prompt_tokens: routing_parts.token_ids.len() as u64,
+                    best_router_tokens: max_cached_tokens as u64,
+                    selected_router_tokens: selection.cached_tokens as u64,
+                })
+            })
+        } else {
+            None
+        };
+        let mut guard = match cleanup {
+            Some(cleanup) => RequestGuard::new_kv_with_cleanup(
+                self.request_metrics.clone(),
+                cleanup,
+                request,
+                cache_loss_tracking,
+            ),
             None => RequestGuard::new_kv(
                 Arc::clone(chooser),
                 self.request_metrics.clone(),
@@ -351,8 +384,23 @@ where
                 selected_worker,
                 selection.attempt,
                 request,
+                cache_loss_tracking,
             ),
         };
+        if let (Some(history), Some(prompt_hashes)) =
+            (self.cache_history.as_ref(), history_prompt_hashes)
+        {
+            guard.track_cache_history(
+                CacheHistoryTracking::new(
+                    Arc::clone(history),
+                    prompt_hashes,
+                    routing_parts.token_ids.len() as u64,
+                ),
+                request,
+                chooser.block_size(),
+                chooser.is_eagle(),
+            );
+        }
 
         let record_result: Result<(), Error> = async {
             if !is_query_only && chooser.indexer().records_routing_decisions() {

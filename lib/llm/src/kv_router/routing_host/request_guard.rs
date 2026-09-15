@@ -6,6 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     kv_router::{
         KvRouter,
+        cache_history::CacheHistory,
         indexer::ApproximateRequestLease,
         metrics::RouterRequestMetrics,
         prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
@@ -72,6 +73,131 @@ struct MaterializedOutputBlocks {
     blocks: Vec<ApproximateLruBlock>,
     start_position: usize,
     private_blocks: usize,
+}
+
+pub(super) struct CacheHistoryTracking {
+    history: Arc<CacheHistory>,
+    prompt_hashes: Vec<u64>,
+    output_hashes: Vec<u64>,
+    prompt_tokens: u64,
+    previously_seen_tokens: u64,
+}
+
+impl CacheHistoryTracking {
+    pub(super) fn new(
+        history: Arc<CacheHistory>,
+        prompt_hashes: Vec<u64>,
+        prompt_tokens: u64,
+    ) -> Self {
+        let previously_seen_tokens = history.previously_computed_tokens(&prompt_hashes);
+        Self {
+            history,
+            prompt_hashes,
+            output_hashes: Vec::new(),
+            prompt_tokens,
+            previously_seen_tokens,
+        }
+    }
+}
+
+struct CacheHistoryFinalization {
+    prompt_tokens: u64,
+    previously_seen_tokens: u64,
+    retained: Option<crate::kv_router::cache_history::CacheHistoryStats>,
+}
+
+fn finalize_cache_history(
+    tracking: &mut Option<CacheHistoryTracking>,
+    record_completed: bool,
+) -> Option<CacheHistoryFinalization> {
+    let tracking = tracking.take()?;
+    let retained = record_completed
+        .then(|| {
+            tracking.history.record_completed(
+                tracking
+                    .prompt_hashes
+                    .iter()
+                    .copied()
+                    .chain(tracking.output_hashes.iter().copied()),
+            )
+        })
+        .flatten();
+    Some(CacheHistoryFinalization {
+        prompt_tokens: tracking.prompt_tokens,
+        previously_seen_tokens: tracking.previously_seen_tokens,
+        retained,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct CacheLossWorkerOutcome {
+    complete: bool,
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    gpu_hit_tokens: u64,
+    #[serde(default)]
+    cpu_hit_tokens: u64,
+    #[serde(default)]
+    cpu_lookup_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RouteObservation {
+    pub(super) prompt_tokens: u64,
+    pub(super) best_router_tokens: u64,
+    pub(super) selected_router_tokens: u64,
+}
+
+pub(super) struct CacheLossTracking {
+    route: RouteObservation,
+}
+
+impl CacheLossTracking {
+    pub(super) fn new(route: RouteObservation) -> Self {
+        Self { route }
+    }
+}
+
+fn cache_loss_worker_stages(
+    route: RouteObservation,
+    outcome: &CacheLossWorkerOutcome,
+) -> Option<[u64; 4]> {
+    let f2 = route.best_router_tokens;
+    let f3 = route.selected_router_tokens;
+    let f4 = outcome
+        .gpu_hit_tokens
+        .checked_add(outcome.cpu_lookup_tokens)?;
+    let f5 = outcome.gpu_hit_tokens.checked_add(outcome.cpu_hit_tokens)?;
+    Some([f2, f3, f4, f5])
+}
+
+fn valid_cache_loss_worker_outcome(
+    route: RouteObservation,
+    value: &serde_json::Value,
+) -> Option<CacheLossWorkerOutcome> {
+    let outcome = <CacheLossWorkerOutcome as serde::Deserialize>::deserialize(value).ok()?;
+    (outcome.complete && outcome.prompt_tokens == route.prompt_tokens).then_some(outcome)
+}
+
+fn begin_cache_reuse_finalization(started: bool, recorded: &mut bool) -> bool {
+    if !started || *recorded {
+        return false;
+    }
+    *recorded = true;
+    true
+}
+
+fn cache_reuse_observation_complete(
+    stream_completed: bool,
+    history_expected: bool,
+    history_present: bool,
+    worker_expected: bool,
+    worker_present: bool,
+) -> bool {
+    stream_completed
+        && (!history_expected || history_present)
+        && (!worker_expected || worker_present)
 }
 
 pub(crate) fn prompt_private_blocks(
@@ -581,6 +707,11 @@ where
     record_itl_at_completion: bool,
     prefill_marked: bool,
     migration_state: Option<MigrationState>,
+    cache_history: Option<CacheHistoryTracking>,
+    cache_loss: Option<RouteObservation>,
+    cache_loss_worker_outcome: Option<CacheLossWorkerOutcome>,
+    cache_reuse_started: bool,
+    cache_reuse_recorded: bool,
     _lora_load: Option<LoraLoadGuard>,
 }
 
@@ -595,11 +726,13 @@ where
         worker: WorkerWithDpRank,
         attempt: AdmissionAttempt,
         request: &PreprocessedRequest,
+        cache_loss_tracking: Option<CacheLossTracking>,
     ) -> Self {
         Self::new_kv_with_cleanup(
             request_metrics,
             KvRequestCleanup::new(chooser, context_id, worker, attempt),
             request,
+            cache_loss_tracking,
         )
     }
 
@@ -607,6 +740,7 @@ where
         request_metrics: Arc<RouterRequestMetrics>,
         cleanup: KvRequestCleanup<Sel>,
         request: &PreprocessedRequest,
+        cache_loss_tracking: Option<CacheLossTracking>,
     ) -> Self {
         let chooser = &cleanup.chooser;
         let block_size = chooser.block_size() as usize;
@@ -618,6 +752,7 @@ where
         let attempt_id = cleanup
             .lifecycle()
             .map(|lifecycle| lifecycle.booking().attempt_id);
+        let cache_loss = cache_loss_tracking.as_ref().map(|tracking| tracking.route);
         let track_output_blocks =
             attempt_id.is_some() && chooser.kv_router_config().router_track_output_blocks;
         if attempt_id.is_some() {
@@ -627,7 +762,7 @@ where
         let output_hashes = approximate_lru
             .as_ref()
             .map(|_| CanonicalOutputTracker::new(request, block_size as u32, chooser.is_eagle()));
-        Self {
+        let mut guard = Self {
             cleanup: RequestCleanup::Kv(cleanup),
             observability: RequestObservability::new(request.tracker.clone(), request_metrics),
             output_blocks: OutputBlockTracker::new(
@@ -641,8 +776,17 @@ where
             record_itl_at_completion: false,
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
+            cache_history: None,
+            cache_loss,
+            cache_loss_worker_outcome: None,
+            cache_reuse_started: false,
+            cache_reuse_recorded: false,
             _lora_load: None,
+        };
+        if let Some(route) = cache_loss {
+            guard.start_cache_reuse(route.prompt_tokens);
         }
+        guard
     }
 
     pub(super) fn new_builtin(
@@ -670,6 +814,11 @@ where
             record_itl_at_completion: true,
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
+            cache_history: None,
+            cache_loss: None,
+            cache_loss_worker_outcome: None,
+            cache_reuse_started: false,
+            cache_reuse_recorded: false,
             _lora_load: lora_load,
         }
     }
@@ -704,6 +853,32 @@ where
         self.approximate_lru.is_some()
     }
 
+    fn start_cache_reuse(&mut self, prompt_tokens: u64) {
+        if self.cache_reuse_started {
+            return;
+        }
+        self.cache_reuse_started = true;
+        self.observability
+            .request_metrics()
+            .observe_cache_reuse_input(prompt_tokens);
+    }
+
+    pub(super) fn track_cache_history(
+        &mut self,
+        tracking: CacheHistoryTracking,
+        request: &PreprocessedRequest,
+        block_size: u32,
+        is_eagle: bool,
+    ) {
+        self.start_cache_reuse(tracking.prompt_tokens);
+        let parent_hash = tracking.prompt_hashes.last().copied();
+        let output_hashes = self
+            .output_hashes
+            .get_or_insert_with(|| CanonicalOutputTracker::new(request, block_size, is_eagle));
+        output_hashes.set_prompt_parent(parent_hash);
+        self.cache_history = Some(tracking);
+    }
+
     pub(super) async fn acquire_approximate_lru(
         &mut self,
         hashes: RoutingDecisionHashes,
@@ -718,7 +893,9 @@ where
         };
         let mode = lease.acquire(hashes, private_blocks).await?;
         if mode != ApproximateAcquireMode::Lru {
-            self.output_hashes = None;
+            if self.cache_history.is_none() {
+                self.output_hashes = None;
+            }
             return Ok(());
         }
         if let Some(output_hashes) = self.output_hashes.as_mut() {
@@ -760,31 +937,43 @@ where
             }
         }
 
-        if self
+        let track_approximate = self
             .cleanup
             .lifecycle()
             .is_some_and(RequestAttemptLease::is_active)
-            && let (Some(data), Some(output_hashes), Some(lease)) = (
-                item.data.as_ref(),
-                self.output_hashes.as_mut(),
-                self.approximate_lru.as_ref(),
-            )
-            && let Some(materialized) =
-                output_hashes.observe(data.index.unwrap_or(0), &data.token_ids)
-            && let Err(error) = lease.materialize(
-                materialized.parent_hash,
-                materialized.blocks,
-                materialized.start_position,
-                materialized.private_blocks,
-            )
-        {
-            tracing::warn!(
-                request_id = self.cleanup.context_id().unwrap_or("stateless"),
-                %error,
-                "Failed to materialize approximate LRU output blocks"
-            );
+            && self.approximate_lru.is_some();
+        let materialized = (track_approximate || self.cache_history.is_some())
+            .then(|| {
+                let data = item.data.as_ref()?;
+                self.output_hashes
+                    .as_mut()?
+                    .observe(data.index.unwrap_or(0), &data.token_ids)
+            })
+            .flatten();
+        if let Some(materialized) = materialized {
+            if let Some(history) = self.cache_history.as_mut() {
+                history
+                    .output_hashes
+                    .extend(materialized.blocks.iter().map(|block| block.sequence_hash));
+            }
+            if track_approximate
+                && let Some(lease) = self.approximate_lru.as_ref()
+                && let Err(error) = lease.materialize(
+                    materialized.parent_hash,
+                    materialized.blocks,
+                    materialized.start_position,
+                    materialized.private_blocks,
+                )
+            {
+                tracing::warn!(
+                    request_id = self.cleanup.context_id().unwrap_or("stateless"),
+                    %error,
+                    "Failed to materialize approximate LRU output blocks"
+                );
+            }
         }
         self.observability.observe_tokens(new_tokens);
+        self.observe_cache_loss_worker_outcome(item);
         let cumulative_osl = self.observability.cumulative_osl();
         let Some(update) = self.output_blocks.observe(cumulative_osl) else {
             return;
@@ -810,13 +999,85 @@ where
 
     pub(super) async fn finish(&mut self) {
         // Metrics must observe the completed request before cleanup releases its state.
+        self.finish_cache_reuse(true);
         self.observability
             .record_metrics(self.record_itl_at_completion);
         self.cleanup.finish().await;
     }
 
     pub(super) async fn abort(&mut self) {
+        self.finish_cache_reuse(false);
         self.cleanup.finish().await;
+    }
+
+    fn observe_cache_loss_worker_outcome(&mut self, item: &Annotated<LLMEngineOutput>) {
+        if self.cache_reuse_recorded || self.cache_loss_worker_outcome.is_some() {
+            return;
+        }
+        let Some(route) = self.cache_loss else {
+            return;
+        };
+        let Some(value) = item
+            .data
+            .as_ref()
+            .and_then(|data| data.engine_data.as_ref())
+            .and_then(|data| data.get("cache_loss"))
+        else {
+            return;
+        };
+        let Some(outcome) = valid_cache_loss_worker_outcome(route, value) else {
+            return;
+        };
+
+        self.cache_loss_worker_outcome = Some(outcome);
+    }
+
+    fn finish_cache_reuse(&mut self, stream_completed: bool) {
+        if !begin_cache_reuse_finalization(self.cache_reuse_started, &mut self.cache_reuse_recorded)
+        {
+            return;
+        }
+
+        let history_expected = self.cache_history.is_some();
+        let worker_expected = self.cache_loss.is_some();
+        let history = finalize_cache_history(&mut self.cache_history, stream_completed);
+        let worker_stages = stream_completed
+            .then(|| {
+                let route = self.cache_loss?;
+                let outcome = self.cache_loss_worker_outcome.take()?;
+                cache_loss_worker_stages(route, &outcome)
+            })
+            .flatten();
+
+        if let Some(stats) = history.as_ref().and_then(|result| result.retained) {
+            self.observability
+                .request_metrics()
+                .set_cache_history_retained(stats);
+        }
+
+        let complete = cache_reuse_observation_complete(
+            stream_completed,
+            history_expected,
+            history.is_some(),
+            worker_expected,
+            worker_stages.is_some(),
+        );
+        if !complete {
+            self.observability
+                .request_metrics()
+                .observe_cache_reuse_incomplete();
+            return;
+        }
+
+        let prompt_tokens = history
+            .as_ref()
+            .map(|result| result.prompt_tokens)
+            .or_else(|| self.cache_loss.map(|route| route.prompt_tokens))
+            .expect("cache-reuse tracking must have a prompt length");
+        let previously_seen_tokens = history.as_ref().map(|result| result.previously_seen_tokens);
+        self.observability
+            .request_metrics()
+            .observe_cache_reuse_complete(prompt_tokens, previously_seen_tokens, worker_stages);
     }
 }
 
@@ -825,9 +1086,161 @@ where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
     fn drop(&mut self) {
+        self.finish_cache_reuse(false);
         self.observability
             .record_metrics(self.record_itl_at_completion);
         // RequestCleanup drops immediately afterward and performs resource cleanup.
+    }
+}
+
+#[cfg(test)]
+mod cache_history_tests {
+    use super::*;
+
+    #[test]
+    fn completed_request_observes_once_and_records_membership() {
+        let history = Arc::new(CacheHistory::with_capacity(4, 8));
+        let mut tracking = Some(CacheHistoryTracking::new(history.clone(), vec![10], 8));
+
+        let first = finalize_cache_history(&mut tracking, true).unwrap();
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.previously_seen_tokens, 0);
+        assert!(first.retained.is_some());
+        assert_eq!(history.previously_computed_tokens(&[10]), 8);
+        assert!(finalize_cache_history(&mut tracking, true).is_none());
+    }
+
+    #[test]
+    fn aborted_request_observes_once_without_recording_membership() {
+        let history = Arc::new(CacheHistory::with_capacity(4, 8));
+        let mut tracking = Some(CacheHistoryTracking::new(history.clone(), vec![10], 8));
+
+        let first = finalize_cache_history(&mut tracking, false).unwrap();
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.previously_seen_tokens, 0);
+        assert!(first.retained.is_none());
+        assert_eq!(history.previously_computed_tokens(&[10]), 0);
+        assert!(finalize_cache_history(&mut tracking, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cache_loss_tests {
+    use super::*;
+
+    fn route() -> RouteObservation {
+        RouteObservation {
+            prompt_tokens: 100,
+            best_router_tokens: 75,
+            selected_router_tokens: 60,
+        }
+    }
+
+    fn outcome() -> CacheLossWorkerOutcome {
+        CacheLossWorkerOutcome {
+            complete: true,
+            prompt_tokens: 100,
+            gpu_hit_tokens: 70,
+            cpu_hit_tokens: 15,
+            cpu_lookup_tokens: 20,
+        }
+    }
+
+    #[test]
+    fn worker_outcomes_can_exceed_router_observations() {
+        let route = route();
+        let outcome = outcome();
+
+        assert_eq!(
+            cache_loss_worker_stages(route, &outcome),
+            Some([75, 60, 90, 85])
+        );
+    }
+
+    #[test]
+    fn stages_preserve_values_above_prior_stages_and_prompt_length() {
+        let route = RouteObservation {
+            prompt_tokens: 100,
+            best_router_tokens: 110,
+            selected_router_tokens: 105,
+        };
+        let outcome = CacheLossWorkerOutcome {
+            complete: true,
+            prompt_tokens: 100,
+            gpu_hit_tokens: 120,
+            cpu_hit_tokens: 15,
+            cpu_lookup_tokens: 20,
+        };
+
+        assert_eq!(
+            cache_loss_worker_stages(route, &outcome),
+            Some([110, 105, 140, 135])
+        );
+    }
+
+    #[test]
+    fn counter_overflow_marks_the_observation_incomplete() {
+        let route = RouteObservation {
+            prompt_tokens: 100,
+            best_router_tokens: 75,
+            selected_router_tokens: 60,
+        };
+        let outcome = CacheLossWorkerOutcome {
+            complete: true,
+            prompt_tokens: 100,
+            gpu_hit_tokens: u64::MAX,
+            cpu_hit_tokens: 1,
+            cpu_lookup_tokens: 0,
+        };
+
+        assert_eq!(cache_loss_worker_stages(route, &outcome), None);
+    }
+
+    #[test]
+    fn invalid_worker_outcome_does_not_block_a_later_valid_branch() {
+        let route = route();
+        assert!(
+            valid_cache_loss_worker_outcome(route, &serde_json::json!({"complete": false}),)
+                .is_none()
+        );
+        let value = serde_json::json!({
+            "complete": true,
+            "prompt_tokens": 100,
+            "gpu_hit_tokens": 70,
+            "cpu_hit_tokens": 15,
+            "cpu_lookup_tokens": 20,
+        });
+        let worker_outcome = valid_cache_loss_worker_outcome(route, &value).unwrap();
+        assert_eq!(
+            cache_loss_worker_stages(route, &worker_outcome),
+            Some([75, 60, 90, 85])
+        );
+    }
+
+    #[test]
+    fn cache_reuse_finalization_is_exactly_once() {
+        let mut recorded = false;
+        assert!(begin_cache_reuse_finalization(true, &mut recorded));
+        assert!(!begin_cache_reuse_finalization(true, &mut recorded));
+    }
+
+    #[test]
+    fn combined_observation_requires_every_enabled_stage_source() {
+        assert!(cache_reuse_observation_complete(
+            true, true, true, true, true
+        ));
+        assert!(cache_reuse_observation_complete(
+            true, true, true, false, false
+        ));
+        assert!(cache_reuse_observation_complete(
+            true, false, false, true, true
+        ));
+        assert!(!cache_reuse_observation_complete(
+            true, true, true, true, false
+        ));
+        assert!(!cache_reuse_observation_complete(
+            false, true, true, true, true
+        ));
     }
 }
 
@@ -1014,6 +1427,7 @@ mod prefill_start_tests {
             )
             .unwrap(),
             overlap_blocks_lost: hist_vec("overlap_blocks_lost"),
+            cache_reuse: None,
         })
     }
 
