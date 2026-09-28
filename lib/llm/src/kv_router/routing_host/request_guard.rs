@@ -5,8 +5,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     kv_router::{
-        KvRouter, indexer::ApproximateRequestLease, metrics::RouterRequestMetrics,
-        prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION, request_lease::RequestAttemptLease,
+        KvRouter,
+        indexer::ApproximateRequestLease,
+        metrics::{RouterRequestMetrics, WorkerReport},
+        prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
+        request_lease::RequestAttemptLease,
     },
     lora::LoadEstimator,
     preprocessor::PreprocessedRequest,
@@ -78,6 +81,14 @@ pub(super) struct RouteObservation {
     pub(super) selected_router_tokens: u64,
 }
 
+struct KvHitTracking {
+    route: RouteObservation,
+    model: String,
+    phase: RequestPhase,
+    report: Option<WorkerReport>,
+    recorded: bool,
+}
+
 /// Cache-hit report the worker attaches to its final chunk (`engine_data.kv_cache_hit`).
 #[derive(serde::Deserialize)]
 struct WorkerCacheHitReport {
@@ -85,21 +96,11 @@ struct WorkerCacheHitReport {
     #[serde(default)]
     prompt_tokens: u64,
     #[serde(default)]
-    gpu_hit_tokens: u64,
+    local_hit_tokens: u64,
     #[serde(default)]
-    cpu_hit_tokens: u64,
+    external_hit_tokens: u64,
     #[serde(default)]
-    cpu_lookup_tokens: Option<u64>,
-}
-
-/// Worker cache-hit report latched for one tracked attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerReport {
-    /// `[lookup tokens, reused tokens]` from a valid report.
-    Tokens([u64; 2]),
-    LookupUnavailable(u64),
-    /// A valid report whose token sums overflow `u64`; finalizes as incomplete.
-    Overflowed,
+    external_lookup_tokens: Option<u64>,
 }
 
 /// `None` when the report is not usable (incomplete, or describes a different prompt
@@ -112,11 +113,13 @@ fn worker_cache_hit_tokens(
     if !report.complete || report.prompt_tokens != route.prompt_tokens {
         return None;
     }
-    let reused = report.gpu_hit_tokens.checked_add(report.cpu_hit_tokens);
-    let Some(external_lookup) = report.cpu_lookup_tokens else {
+    let reused = report
+        .local_hit_tokens
+        .checked_add(report.external_hit_tokens);
+    let Some(external_lookup) = report.external_lookup_tokens else {
         return Some(reused.map_or(WorkerReport::Overflowed, WorkerReport::LookupUnavailable));
     };
-    let lookup = report.gpu_hit_tokens.checked_add(external_lookup);
+    let lookup = report.local_hit_tokens.checked_add(external_lookup);
     Some(match lookup.zip(reused) {
         Some((lookup, reused)) => WorkerReport::Tokens([lookup, reused]),
         None => WorkerReport::Overflowed,
@@ -124,15 +127,11 @@ fn worker_cache_hit_tokens(
 }
 
 /// The worker-side emission for an attempt: the latched tokens only if the stream completed.
-fn kv_worker_hit_for(
-    stream_completed: bool,
-    report: Option<WorkerReport>,
-) -> Option<(Option<u64>, u64)> {
+fn kv_worker_hit_for(stream_completed: bool, report: Option<WorkerReport>) -> Option<WorkerReport> {
     match report {
-        Some(WorkerReport::Tokens([lookup, reused])) if stream_completed => {
-            Some((Some(lookup), reused))
+        Some(WorkerReport::Tokens(_) | WorkerReport::LookupUnavailable(_)) if stream_completed => {
+            report
         }
-        Some(WorkerReport::LookupUnavailable(reused)) if stream_completed => Some((None, reused)),
         _ => None,
     }
 }
@@ -638,34 +637,11 @@ pub(super) struct RequestGuard {
     record_itl_at_completion: bool,
     prefill_marked: bool,
     migration_state: Option<MigrationState>,
-    kv_route: Option<RouteObservation>,
-    kv_worker_report: Option<WorkerReport>,
-    kv_model: String,
-    kv_phase: RequestPhase,
-    kv_worker_recorded: bool,
+    kv_hit: Option<KvHitTracking>,
     _lora_load: Option<LoraLoadGuard>,
 }
 
 impl RequestGuard {
-    pub(super) fn new_kv(
-        chooser: Arc<KvRouter>,
-        request_metrics: Arc<RouterRequestMetrics>,
-        context_id: String,
-        worker: WorkerWithDpRank,
-        booking: Option<BookingHandle>,
-        request: &PreprocessedRequest,
-        kv_route: Option<RouteObservation>,
-        request_lifecycle: Option<Box<RequestLifecycle>>,
-    ) -> Self {
-        Self::new_kv_with_cleanup(
-            request_metrics,
-            KvRequestCleanup::new(chooser, context_id, worker, booking),
-            request,
-            kv_route,
-            request_lifecycle,
-        )
-    }
-
     pub(super) fn new_kv_with_cleanup(
         request_metrics: Arc<RouterRequestMetrics>,
         mut cleanup: KvRequestCleanup,
@@ -692,11 +668,7 @@ impl RequestGuard {
         if attempt_id.is_some() {
             request_metrics.requests_started_total.inc();
         }
-        let phase = request
-            .tracker
-            .as_ref()
-            .map(|tracker| tracker.phase())
-            .unwrap_or_default();
+        let phase = request.phase();
         if let Some(route) = kv_route {
             request_metrics.observe_kv_route_estimate(
                 phase,
@@ -723,11 +695,13 @@ impl RequestGuard {
             record_itl_at_completion: false,
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
-            kv_route,
-            kv_worker_report: None,
-            kv_worker_recorded: false,
-            kv_model: request.model.clone(),
-            kv_phase: phase,
+            kv_hit: kv_route.map(|route| KvHitTracking {
+                route,
+                report: None,
+                recorded: false,
+                model: request.model.clone(),
+                phase,
+            }),
             _lora_load: None,
         }
     }
@@ -757,15 +731,7 @@ impl RequestGuard {
             record_itl_at_completion: true,
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
-            kv_route: None,
-            kv_worker_report: None,
-            kv_worker_recorded: false,
-            kv_model: request.model.clone(),
-            kv_phase: request
-                .tracker
-                .as_ref()
-                .map(|tracker| tracker.phase())
-                .unwrap_or_default(),
+            kv_hit: None,
             _lora_load: lora_load,
         }
     }
@@ -961,32 +927,35 @@ impl RequestGuard {
 
     /// Latch the first valid worker cache-hit report for this attempt.
     fn capture_kv_worker_hit(&mut self, item: &Annotated<LLMEngineOutput>) {
-        if self.kv_worker_recorded || self.kv_worker_report.is_some() {
-            return;
-        }
-        let Some(route) = self.kv_route else {
+        let Some(kv) = self.kv_hit.as_mut() else {
             return;
         };
-        self.kv_worker_report = item
+        if kv.recorded || kv.report.is_some() {
+            return;
+        }
+        kv.report = item
             .data
             .as_ref()
             .and_then(|data| data.engine_data.as_ref())
             .and_then(|data| data.get("kv_cache_hit"))
-            .and_then(|value| worker_cache_hit_tokens(route, value));
+            .and_then(|value| worker_cache_hit_tokens(kv.route, value));
     }
 
     /// Emit the worker-side series once per tracked attempt: lookup/reused tokens plus a
     /// complete outcome when the stream finished with a valid report, otherwise incomplete.
     fn record_kv_worker_outcome(&mut self, stream_completed: bool) {
-        if self.kv_route.is_none() || std::mem::replace(&mut self.kv_worker_recorded, true) {
+        let Some(kv) = self.kv_hit.as_mut() else {
+            return;
+        };
+        if std::mem::replace(&mut kv.recorded, true) {
             return;
         }
-        let hit = kv_worker_hit_for(stream_completed, self.kv_worker_report.take());
-        let phase = self.kv_phase;
+        let hit = kv_worker_hit_for(stream_completed, kv.report.take());
+        let phase = kv.phase;
         let metrics = self.observability.request_metrics();
         match hit {
-            Some(tokens) => metrics.observe_kv_worker_hit(phase, &self.kv_model, tokens),
-            None => metrics.observe_kv_worker_incomplete(phase, &self.kv_model),
+            Some(tokens) => metrics.observe_kv_worker_hit(phase, &kv.model, tokens),
+            None => metrics.observe_kv_worker_incomplete(phase, &kv.model),
         }
     }
 }
@@ -1012,22 +981,14 @@ mod kv_cache_hit_tests {
         }
     }
 
-    fn report(gpu_hit: u64, cpu_hit: u64, cpu_lookup: u64) -> serde_json::Value {
+    fn report(local_hit: u64, external_hit: u64, external_lookup: u64) -> serde_json::Value {
         serde_json::json!({
             "complete": true,
             "prompt_tokens": 100,
-            "gpu_hit_tokens": gpu_hit,
-            "cpu_hit_tokens": cpu_hit,
-            "cpu_lookup_tokens": cpu_lookup,
+            "local_hit_tokens": local_hit,
+            "external_hit_tokens": external_hit,
+            "external_lookup_tokens": external_lookup,
         })
-    }
-
-    #[test]
-    fn worker_outcomes_can_exceed_router_observations() {
-        assert_eq!(
-            worker_cache_hit_tokens(route(), &report(70, 15, 20)),
-            Some(WorkerReport::Tokens([90, 85]))
-        );
     }
 
     #[test]
@@ -1051,8 +1012,6 @@ mod kv_cache_hit_tests {
 
     #[test]
     fn counter_overflow_marks_the_observation_incomplete() {
-        // A valid report whose sums overflow is latched (blocking later reports) and
-        // finalizes as incomplete — same as the PR head.
         let overflowing = report(u64::MAX, 0, 1);
         assert_eq!(
             worker_cache_hit_tokens(route(), &overflowing),
@@ -1065,37 +1024,23 @@ mod kv_cache_hit_tests {
     }
 
     #[test]
-    fn successful_stream_emits_the_latched_hit() {
-        assert_eq!(
-            kv_worker_hit_for(true, Some(WorkerReport::Tokens([90, 85]))),
-            Some((Some(90), 85))
-        );
-    }
-
-    #[test]
     fn missing_lookup_is_not_a_zero_or_a_reuse_estimate() {
         let mut value = report(70, 15, 20);
-        value["cpu_lookup_tokens"] = serde_json::Value::Null;
+        value["external_lookup_tokens"] = serde_json::Value::Null;
         let parsed = worker_cache_hit_tokens(route(), &value);
         assert_eq!(parsed, Some(WorkerReport::LookupUnavailable(85)));
-        assert_eq!(kv_worker_hit_for(true, parsed), Some((None, 85)));
+        assert_eq!(kv_worker_hit_for(true, parsed), parsed);
         assert_eq!(kv_worker_hit_for(false, parsed), None);
-        value.as_object_mut().unwrap().remove("cpu_lookup_tokens");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("external_lookup_tokens");
         assert_eq!(worker_cache_hit_tokens(route(), &value), parsed);
-        value["gpu_hit_tokens"] = u64::MAX.into();
+        value["local_hit_tokens"] = u64::MAX.into();
         assert_eq!(
             worker_cache_hit_tokens(route(), &value),
             Some(WorkerReport::Overflowed)
         );
-    }
-
-    #[test]
-    fn stream_error_discards_a_buffered_hit() {
-        assert_eq!(
-            kv_worker_hit_for(false, Some(WorkerReport::Tokens([90, 85]))),
-            None
-        );
-        assert_eq!(kv_worker_hit_for(true, None), None);
     }
 }
 #[cfg(test)]
@@ -1258,7 +1203,7 @@ mod prefill_start_tests {
     }
 
     fn test_metrics() -> Arc<RouterRequestMetrics> {
-        RouterRequestMetrics::for_test(&prometheus::Registry::new())
+        RouterRequestMetrics::for_test(&dynamo_runtime::MetricsRegistry::new())
     }
 
     async fn dispatch_once(phase: RequestPhase, annotations: Vec<String>) -> Arc<RequestTracker> {

@@ -153,7 +153,7 @@ pub struct SchedulingResponse {
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,
     /// Greatest raw router-visible overlap among eligible workers, in tokens,
-    /// when worker-stage telemetry is enabled.
+    /// for tracked requests.
     pub max_raw_cached_tokens: Option<usize>,
     /// Raw prefix overlap for the selected worker and DP rank, in tokens.
     pub selected_raw_cached_tokens: Option<usize>,
@@ -620,8 +620,8 @@ mod tests {
             session_context: None,
             overlap: OverlapSignals {
                 tier_overlap_blocks: Default::default(),
-                effective_overlap_blocks: HashMap::default(),
-                effective_cached_tokens: HashMap::default(),
+                effective_overlap_blocks: Default::default(),
+                effective_cached_tokens: Default::default(),
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,

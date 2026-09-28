@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::extensions::{AgentContext, RouterParams};
-use super::timing::RequestTracker;
+use super::timing::{RequestPhase, RequestTracker};
 use super::{OutputOptions, SamplingOptions, StopConditions};
 use crate::preprocessor::media::RdmaMediaDataDescriptor;
 use crate::protocols::TokenIdType;
@@ -464,6 +464,18 @@ pub struct PreprocessedRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_context: Option<AgentContext>,
 
+    /// Opaque frontend-derived scope for partitioning backend `ImageLoader`
+    /// URL caches and Dynamo-owned image embedding caches. This does not
+    /// namespace engine KV caches.
+    ///
+    /// This is carried separately from `agent_context` because backends need
+    /// only the opaque cache scope, not agent lifecycle metadata.
+    /// The optional field is safe across rolling upgrades: older readers
+    /// ignore it and newer readers default it when an older frontend omits it.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_cache_scope: Option<String>,
+
     /// Multimodal processor kwargs forwarded to the backend engine
     /// (e.g. `{"use_audio_in_video": true}` for omni models).
     #[builder(default)]
@@ -527,6 +539,13 @@ where
 }
 
 impl PreprocessedRequest {
+    pub fn phase(&self) -> RequestPhase {
+        self.tracker
+            .as_ref()
+            .map(|tracker| tracker.phase())
+            .unwrap_or_default()
+    }
+
     pub fn has_annotation(&self, annotation: &str) -> bool {
         self.annotations.contains(&annotation.to_string())
     }
@@ -627,6 +646,16 @@ mod tests {
             .output_options(OutputOptions::default())
             .build()
             .expect("valid request")
+    }
+
+    #[tokio::test]
+    async fn phase_defaults_to_aggregated_and_follows_tracker() {
+        let mut request = request_with_tokens(vec![1]);
+        assert_eq!(request.phase(), RequestPhase::Aggregated);
+        let tracker = Arc::new(RequestTracker::new());
+        request.tracker = Some(tracker.clone());
+        let _permit = tracker.set_phase(RequestPhase::Prefill).await;
+        assert_eq!(request.phase(), RequestPhase::Prefill);
     }
 
     #[test]

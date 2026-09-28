@@ -6,6 +6,7 @@ use std::ops::Range;
 use dynamo_backend_common::{
     DynamoError, EngineConfig, LlmRegistration, RlAdminBaseUrl, RlWorkerMetadata,
 };
+use dynamo_llm::local_model::runtime_config::VLLM_INFERENCE_V1_GENERATE_CAPABILITY;
 
 use crate::client;
 use crate::proto as pb;
@@ -21,6 +22,7 @@ struct ModelIdentity {
     tool_call_parser: Option<String>,
     supports_lora: bool,
     max_loras: u32,
+    supports_multimodal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,7 @@ impl DiscoveredModel {
             tool_call_parser: tool_call_parser.clone(),
             supports_lora,
             max_loras,
+            supports_multimodal: model.supports_multimodal,
         };
         Ok(Self {
             source,
@@ -183,10 +186,16 @@ impl DiscoveredModel {
             model: self.source.clone(),
             served_model_name: Some(self.served_name.clone()),
             model_aliases: self.identity.aliases.clone(),
-            runtime_data: [(
-                dynamo_llm::lora::LORA_REQUIRES_REGISTRATION.to_string(),
-                serde_json::Value::Bool(true),
-            )]
+            runtime_data: [
+                (
+                    dynamo_llm::lora::LORA_REQUIRES_REGISTRATION.to_string(),
+                    serde_json::Value::Bool(true),
+                ),
+                (
+                    VLLM_INFERENCE_V1_GENERATE_CAPABILITY.to_string(),
+                    serde_json::Value::Bool(true),
+                ),
+            ]
             .into_iter()
             .collect(),
             llm: Some(LlmRegistration {

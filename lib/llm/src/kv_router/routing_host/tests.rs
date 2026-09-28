@@ -671,12 +671,14 @@ async fn terminal_item_does_not_skip_transport_eof() {
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&router.request_metrics),
-        "terminal-drain".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "terminal-drain".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         Some(RouteObservation {
             prompt_tokens: 1,
@@ -747,12 +749,14 @@ async fn run_kv_hit_attempt(final_frame: LLMEngineOutput) -> (KvHitSnapshot, KvH
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&metrics),
-        "kv-hit-attempt".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "kv-hit-attempt".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         Some(RouteObservation {
             prompt_tokens: 100,
@@ -779,9 +783,9 @@ async fn kv_cache_hit_complete_attempt_records_every_stage_once() {
             "kv_cache_hit": {
                 "complete": true,
                 "prompt_tokens": 100,
-                "gpu_hit_tokens": 70,
-                "cpu_hit_tokens": 15,
-                "cpu_lookup_tokens": 20,
+                "local_hit_tokens": 70,
+                "external_hit_tokens": 15,
+                "external_lookup_tokens": 20,
             }
         })),
         ..Default::default()
@@ -821,9 +825,9 @@ async fn kv_cache_hit_cancelled_attempt_discards_valid_report() {
             "kv_cache_hit": {
                 "complete": true,
                 "prompt_tokens": 100,
-                "gpu_hit_tokens": 70,
-                "cpu_hit_tokens": 15,
-                "cpu_lookup_tokens": 20,
+                "local_hit_tokens": 70,
+                "external_hit_tokens": 15,
+                "external_lookup_tokens": 20,
             }
         })),
         ..Default::default()
@@ -848,18 +852,21 @@ fn cancelled_frame() -> Annotated<LLMEngineOutput> {
 #[serial_test::serial]
 async fn kv_cache_hit_completion_keeps_selection_phase() {
     let (router, runtime) = router(None).await;
-    let metrics =
-        crate::kv_router::metrics::RouterRequestMetrics::for_test(&prometheus::Registry::new());
+    let metrics = crate::kv_router::metrics::RouterRequestMetrics::for_test(
+        &dynamo_runtime::MetricsRegistry::new(),
+    );
     let tracker = Arc::new(RequestTracker::new());
     let permit = tracker.set_phase(RequestPhase::Prefill).await;
     let mut req = request();
     req.tracker = Some(tracker.clone());
-    let mut guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let mut guard = RequestGuard::new_kv_with_cleanup(
         metrics.clone(),
-        "phase-test".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "phase-test".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &req,
         Some(RouteObservation {
             prompt_tokens: 1,
@@ -873,8 +880,8 @@ async fn kv_cache_hit_completion_keeps_selection_phase() {
     guard
         .on_item(&Annotated::from_data(LLMEngineOutput {
             engine_data: Some(serde_json::json!({"kv_cache_hit": {
-                "complete": true, "prompt_tokens": 1, "gpu_hit_tokens": 1,
-                "cpu_hit_tokens": 0, "cpu_lookup_tokens": 0
+                "complete": true, "prompt_tokens": 1, "local_hit_tokens": 1,
+                "external_hit_tokens": 0, "external_lookup_tokens": 0
             }})),
             ..Default::default()
         }))
@@ -908,9 +915,9 @@ async fn kv_cache_hit_without_lookup_records_only_reuse_once() {
             "kv_cache_hit": {
                 "complete": true,
                 "prompt_tokens": 100,
-                "gpu_hit_tokens": 70,
-                "cpu_hit_tokens": 15,
-                "cpu_lookup_tokens": null,
+                "local_hit_tokens": 70,
+                "external_hit_tokens": 15,
+                "external_lookup_tokens": null,
             }
         })),
         ..Default::default()
@@ -968,12 +975,14 @@ async fn shutdown_cancellation_drains_trailing_engine_shutdown_error() {
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&router.request_metrics),
-        "shutdown-drain".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "shutdown-drain".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         None,
         None,
@@ -1016,12 +1025,14 @@ async fn client_cancellation_still_ends_stream_without_draining() {
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&router.request_metrics),
-        "client-cancelled-drain".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "client-cancelled-drain".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         None,
         None,
@@ -1056,12 +1067,14 @@ async fn drain_without_trailing_error_gives_up_at_the_deadline() {
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&router.request_metrics),
-        "shutdown-drain-deadline".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "shutdown-drain-deadline".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         None,
         None,
@@ -1113,12 +1126,14 @@ async fn trailing_error_within_the_drain_window_still_reaches_migration() {
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&router.request_metrics),
-        "drain-window-armed".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "drain-window-armed".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         None,
         None,
@@ -1161,12 +1176,14 @@ async fn always_ready_terminals_cannot_starve_the_drain_deadline() {
         }),
         Arc::clone(&context),
     );
-    let guard = RequestGuard::new_kv(
-        Arc::clone(router.kv_router()),
+    let guard = RequestGuard::new_kv_with_cleanup(
         Arc::clone(&router.request_metrics),
-        "starvation-guard".to_string(),
-        WorkerWithDpRank::from_worker_id(0),
-        None,
+        KvRequestCleanup::new(
+            Arc::clone(router.kv_router()),
+            "starvation-guard".to_string(),
+            WorkerWithDpRank::from_worker_id(0),
+            None,
+        ),
         &request(),
         None,
         None,

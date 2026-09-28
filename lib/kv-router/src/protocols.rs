@@ -1090,8 +1090,11 @@ pub struct WorkerSelectionResult {
     pub cached_tokens: usize,
 
     /// Greatest raw router-visible overlap among eligible workers, in tokens,
-    /// when worker-stage telemetry is enabled.
+    /// for tracked requests.
     pub max_raw_cached_tokens: Option<usize>,
+
+    /// Selected worker's raw router-visible overlap, in tokens, for tracked requests.
+    pub selected_raw_cached_tokens: Option<usize>,
 
     /// Selected worker's projected decode load after adding this request's
     /// prompt blocks, in scheduler-tracked block units.

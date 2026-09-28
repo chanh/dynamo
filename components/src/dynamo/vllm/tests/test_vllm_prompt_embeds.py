@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from vllm.outputs import RequestOutput
 
 from dynamo.vllm.handlers import BaseWorkerHandler
 
@@ -253,61 +254,47 @@ class TestUsageStatistics:
         assert result["completion_tokens"] == 2
         assert result["prompt_tokens_details"] == expected_prompt_tokens_details
 
-    def test_kv_cache_hit_engine_data_uses_worker_counters(self):
-        mock_output = Mock()
-        mock_output.prompt_token_ids = [1, 2, 3, 4]
-        mock_output.num_local_cached_tokens = 2
-        mock_output.num_external_cached_tokens = 1
-        mock_output.num_external_lookup_tokens = 2
+    @pytest.mark.core
+    @pytest.mark.parametrize("num_cached_tokens", [0, 3])
+    def test_kv_cache_hit_engine_data_uses_stock_aggregate_counter(
+        self, num_cached_tokens
+    ):
+        request_output = RequestOutput(
+            request_id="cache-reuse",
+            prompt=None,
+            prompt_token_ids=[1, 2, 3, 4],
+            prompt_logprobs=None,
+            outputs=[],
+            finished=True,
+            num_cached_tokens=num_cached_tokens,
+        )
 
-        assert BaseWorkerHandler._kv_cache_hit_engine_data(mock_output) == {
+        assert BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == {
             "complete": True,
             "prompt_tokens": 4,
-            "gpu_hit_tokens": 2,
-            "cpu_hit_tokens": 1,
-            "cpu_lookup_tokens": 2,
+            "local_hit_tokens": num_cached_tokens,
+            "external_hit_tokens": 0,
+            "external_lookup_tokens": None,
         }
 
-    def test_kv_cache_hit_engine_data_marks_missing_worker_counters_incomplete(self):
-        mock_output = Mock()
-        mock_output.prompt_token_ids = [1, 2]
-        mock_output.num_local_cached_tokens = None
-        mock_output.num_external_cached_tokens = 0
-        mock_output.num_external_lookup_tokens = 0
+    @pytest.mark.core
+    @pytest.mark.parametrize(
+        ("prompt_token_ids", "num_cached_tokens"),
+        [([1, 2], None), (None, 0), (None, None)],
+    )
+    def test_kv_cache_hit_engine_data_marks_missing_counters_incomplete(
+        self, prompt_token_ids, num_cached_tokens
+    ):
+        request_output = RequestOutput(
+            request_id="cache-reuse",
+            prompt=None,
+            prompt_token_ids=prompt_token_ids,
+            prompt_logprobs=None,
+            outputs=[],
+            finished=True,
+            num_cached_tokens=num_cached_tokens,
+        )
 
-        assert BaseWorkerHandler._kv_cache_hit_engine_data(mock_output) == {
+        assert BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == {
             "complete": False
-        }
-
-    def test_kv_cache_hit_engine_data_uses_aggregate_cache_fallback(self):
-        mock_output = Mock()
-        mock_output.prompt_token_ids = [1, 2, 3, 4]
-        mock_output.num_cached_tokens = 3
-        mock_output.num_local_cached_tokens = None
-        mock_output.num_external_cached_tokens = None
-        mock_output.num_external_lookup_tokens = None
-
-        assert BaseWorkerHandler._kv_cache_hit_engine_data(mock_output) == {
-            "complete": True,
-            "prompt_tokens": 4,
-            "gpu_hit_tokens": 3,
-            "cpu_hit_tokens": 0,
-            "cpu_lookup_tokens": None,
-        }
-
-    def test_kv_cache_hit_engine_data_uses_stock_external_counter(self):
-        mock_output = Mock()
-        mock_output.prompt_token_ids = [1, 2, 3, 4]
-        mock_output.num_cached_tokens = 3
-        mock_output.num_local_cached_tokens = None
-        mock_output.num_external_cached_tokens = None
-        mock_output.num_external_computed_tokens = 1
-        mock_output.num_external_lookup_tokens = None
-
-        assert BaseWorkerHandler._kv_cache_hit_engine_data(mock_output) == {
-            "complete": True,
-            "prompt_tokens": 4,
-            "gpu_hit_tokens": 2,
-            "cpu_hit_tokens": 1,
-            "cpu_lookup_tokens": None,
         }
