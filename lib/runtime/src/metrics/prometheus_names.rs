@@ -228,8 +228,7 @@ pub mod frontend_service {
     pub const CACHE_LOSS_FUNNEL_TOKENS_TOTAL: &str = "cache_loss_funnel_tokens_total";
 
     /// Prompt-prefix tokens previously seen in this router's bounded history
-    pub const CACHE_LOSS_HISTORY_PREFIX_TOKENS_TOTAL: &str =
-        "cache_loss_history_prefix_tokens_total";
+    pub const KV_HISTORY_CACHED_PREFIX_TOKENS_TOTAL: &str = "kv_history_cached_prefix_tokens_total";
 
     /// Cache-reuse observations by completion status
     pub const CACHE_LOSS_OBSERVATIONS_TOTAL: &str = "cache_loss_observations_total";
@@ -1036,9 +1035,9 @@ mod tests {
             build_component_metric_name(&format!(
                 "{}{}",
                 router_request::METRIC_PREFIX,
-                frontend_service::CACHE_LOSS_HISTORY_PREFIX_TOKENS_TOTAL
+                frontend_service::KV_HISTORY_CACHED_PREFIX_TOKENS_TOTAL
             )),
-            "dynamo_component_router_cache_loss_history_prefix_tokens_total"
+            "dynamo_component_router_kv_history_cached_prefix_tokens_total"
         );
     }
 
