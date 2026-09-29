@@ -213,14 +213,8 @@ pub mod frontend_service {
     pub const KV_SELECTED_CACHED_PREFIX_TOKENS_TOTAL: &str =
         "kv_selected_cached_prefix_tokens_total";
 
-    /// Worker-reported GPU hits plus external lookup tokens
-    pub const KV_WORKER_LOOKUP_TOKENS_TOTAL: &str = "kv_worker_lookup_tokens_total";
-
     /// Backend-reported cache-hit tokens
     pub const KV_WORKER_REUSED_TOKENS_TOTAL: &str = "kv_worker_reused_tokens_total";
-
-    /// Worker cache-hit reports per tracked attempt, labelled result=complete|lookup_unavailable|incomplete
-    pub const KV_WORKER_OUTCOMES_TOTAL: &str = "kv_worker_outcomes_total";
 
     /// Upper-bound estimation of KV cache transfer latency in disaggregated serving (seconds)
     pub const KV_TRANSFER_ESTIMATED_LATENCY_SECONDS: &str = "kv_transfer_estimated_latency_seconds";
@@ -686,14 +680,8 @@ pub mod router {
     pub const KV_SELECTED_CACHED_PREFIX_TOKENS_TOTAL: &str =
         "router_kv_selected_cached_prefix_tokens_total";
 
-    /// Worker-reported GPU hits plus external lookup tokens (counter)
-    pub const KV_WORKER_LOOKUP_TOKENS_TOTAL: &str = "router_kv_worker_lookup_tokens_total";
-
     /// Backend-reported cache-hit tokens (counter)
     pub const KV_WORKER_REUSED_TOKENS_TOTAL: &str = "router_kv_worker_reused_tokens_total";
-
-    /// Worker cache-hit reports per tracked attempt, result=complete|lookup_unavailable|incomplete
-    pub const KV_WORKER_OUTCOMES_TOTAL: &str = "router_kv_worker_outcomes_total";
 
     /// Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
     pub const SHARED_CACHE_HIT_RATE: &str = "router_shared_cache_hit_rate";

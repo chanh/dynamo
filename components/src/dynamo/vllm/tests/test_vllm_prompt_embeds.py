@@ -270,11 +270,8 @@ class TestUsageStatistics:
         )
 
         assert BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == {
-            "complete": True,
             "prompt_tokens": 4,
-            "local_hit_tokens": num_cached_tokens,
-            "external_hit_tokens": 0,
-            "external_lookup_tokens": None,
+            "reused_tokens": num_cached_tokens,
         }
 
     @pytest.mark.core
@@ -282,7 +279,7 @@ class TestUsageStatistics:
         ("prompt_token_ids", "num_cached_tokens"),
         [([1, 2], None), (None, 0), (None, None)],
     )
-    def test_kv_cache_hit_engine_data_marks_missing_counters_incomplete(
+    def test_kv_cache_hit_engine_data_omits_missing_counters(
         self, prompt_token_ids, num_cached_tokens
     ):
         request_output = RequestOutput(
@@ -295,6 +292,4 @@ class TestUsageStatistics:
             num_cached_tokens=num_cached_tokens,
         )
 
-        assert BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == {
-            "complete": False
-        }
+        assert BaseWorkerHandler._kv_cache_hit_engine_data(request_output) == {}

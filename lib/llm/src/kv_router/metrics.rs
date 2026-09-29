@@ -1043,25 +1043,11 @@ pub struct RouterRequestMetrics {
     pub kv_best_eligible_cached_prefix_tokens: IntCounterVec,
     /// Raw cached prefix tokens on the selected worker and DP rank at selection; same labels.
     pub kv_selected_cached_prefix_tokens: IntCounterVec,
-    /// Worker-reported GPU hits plus external lookup tokens, per complete report; same labels.
-    pub kv_worker_lookup_tokens: IntCounterVec,
-    /// Backend-reported cache-hit tokens, per complete report; same labels.
+    /// Backend-reported reused tokens, counted once per attempt; same labels.
     pub kv_worker_reused_tokens: IntCounterVec,
-    /// Worker cache-hit report per tracked attempt: labels `phase`, `model`, `result`.
-    pub kv_worker_outcomes_total: IntCounterVec,
 }
 
 const KV_PHASE_LABEL: &str = "phase";
-
-/// Worker cache-hit report latched for one tracked attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorkerReport {
-    /// `[lookup tokens, reused tokens]` from a valid report.
-    Tokens([u64; 2]),
-    LookupUnavailable(u64),
-    /// A valid report whose token sums overflow `u64`; finalizes as incomplete.
-    Overflowed,
-}
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
 
@@ -1207,22 +1193,10 @@ impl RouterRequestMetrics {
             frontend_service::KV_SELECTED_CACHED_PREFIX_TOKENS_TOTAL,
             "Raw cached prefix tokens on the selected worker and DP rank",
         );
-        let kv_worker_lookup_tokens = kv_tokens_counter(
-            frontend_service::KV_WORKER_LOOKUP_TOKENS_TOTAL,
-            "Worker-reported local cache hits plus external lookup tokens",
-        );
         let kv_worker_reused_tokens = kv_tokens_counter(
             frontend_service::KV_WORKER_REUSED_TOKENS_TOTAL,
-            "Worker-reported local plus successful external cache-hit tokens",
+            "Worker-reported reused tokens per routing attempt",
         );
-        let kv_worker_outcomes_total = metrics
-            .create_intcountervec(
-                &router_metric(frontend_service::KV_WORKER_OUTCOMES_TOTAL),
-                "Worker cache-hit reports per tracked routing attempt, by phase, model and result",
-                &[KV_PHASE_LABEL, labels::MODEL, "result"],
-                extra_labels,
-            )
-            .expect("failed to create router_kv_worker_outcomes_total");
         Self {
             requests_started_total,
             requests_total,
@@ -1238,9 +1212,7 @@ impl RouterRequestMetrics {
             overlap_blocks_lost,
             kv_best_eligible_cached_prefix_tokens,
             kv_selected_cached_prefix_tokens,
-            kv_worker_lookup_tokens,
             kv_worker_reused_tokens,
-            kv_worker_outcomes_total,
         }
     }
 
@@ -1289,50 +1261,21 @@ impl RouterRequestMetrics {
         self.kv_selected_cached_prefix_tokens
             .with_label_values(labels)
             .inc_by(selected_tokens);
+        // Export zero even when this backend never sends a worker report.
+        self.kv_worker_reused_tokens.with_label_values(labels);
     }
 
-    /// Worker-side tokens for one attempt whose stream completed with a valid report.
+    /// The first valid reuse report received for a tracked attempt.
     pub(crate) fn observe_kv_worker_hit(
         &self,
         phase: RequestPhase,
         model: &str,
-        report: WorkerReport,
+        reused_tokens: u64,
     ) {
-        let (lookup_tokens, reused_tokens) = match report {
-            WorkerReport::Tokens([lookup, reused]) => (Some(lookup), reused),
-            WorkerReport::LookupUnavailable(reused) => (None, reused),
-            WorkerReport::Overflowed => {
-                self.observe_kv_worker_incomplete(phase, model);
-                return;
-            }
-        };
         let labels = &[phase.as_str(), model];
-        if let Some(lookup_tokens) = lookup_tokens {
-            self.kv_worker_lookup_tokens
-                .with_label_values(labels)
-                .inc_by(lookup_tokens);
-        }
         self.kv_worker_reused_tokens
             .with_label_values(labels)
             .inc_by(reused_tokens);
-        self.kv_worker_outcomes_total
-            .with_label_values(&[
-                phase.as_str(),
-                model,
-                if lookup_tokens.is_some() {
-                    "complete"
-                } else {
-                    "lookup_unavailable"
-                },
-            ])
-            .inc();
-    }
-
-    /// A tracked attempt that ended without a usable worker report.
-    pub fn observe_kv_worker_incomplete(&self, phase: RequestPhase, model: &str) {
-        self.kv_worker_outcomes_total
-            .with_label_values(&[phase.as_str(), model, "incomplete"])
-            .inc();
     }
 }
 
@@ -1578,7 +1521,7 @@ mod tests {
             kv_publisher_registration_tests::FakeHierarchy::component("dynamo", "frontend", 0x123);
         let metrics = RouterRequestMetrics::build(&hierarchy, &[(labels::ROUTER_ID, "291")]);
         metrics.observe_kv_route_estimate(RequestPhase::Prefill, "m", 96, 64);
-        metrics.observe_kv_worker_hit(RequestPhase::Prefill, "m", WorkerReport::Tokens([80, 72]));
+        metrics.observe_kv_worker_hit(RequestPhase::Prefill, "m", 72);
         metrics
             .input_sequence_tokens
             .with_label_values(&["prefill", "m"])
@@ -1588,9 +1531,7 @@ mod tests {
             "input_sequence_tokens",
             "kv_best_eligible_cached_prefix_tokens_total",
             "kv_selected_cached_prefix_tokens_total",
-            "kv_worker_lookup_tokens_total",
             "kv_worker_reused_tokens_total",
-            "kv_worker_outcomes_total",
         ] {
             let family = families
                 .iter()
@@ -1622,14 +1563,12 @@ mod tests {
         let registry = dynamo_runtime::MetricsRegistry::new();
         let metrics = RouterRequestMetrics::for_test(&registry);
         metrics.observe_kv_route_estimate(RequestPhase::Prefill, "m", 96, 64);
-        metrics.observe_kv_worker_hit(RequestPhase::Prefill, "m", WorkerReport::Tokens([80, 72]));
-        metrics.observe_kv_worker_incomplete(RequestPhase::Decode, "m");
+        metrics.observe_kv_worker_hit(RequestPhase::Prefill, "m", 72);
 
         let output = registry.prometheus_expfmt_combined().unwrap();
         for (name, value) in [
             ("kv_best_eligible_cached_prefix_tokens", 96),
             ("kv_selected_cached_prefix_tokens", 64),
-            ("kv_worker_lookup_tokens", 80),
             ("kv_worker_reused_tokens", 72),
         ] {
             assert!(
@@ -1641,12 +1580,6 @@ mod tests {
             assert!(!output.contains(&format!("{name}_bucket")));
             assert!(!output.contains(&format!("{name}_sum")));
         }
-        assert!(output.contains(
-            "router_kv_worker_outcomes_total{model=\"m\",phase=\"prefill\",result=\"complete\"} 1"
-        ));
-        assert!(output.contains(
-            "router_kv_worker_outcomes_total{model=\"m\",phase=\"decode\",result=\"incomplete\"} 1"
-        ));
     }
 
     #[test]
@@ -1678,35 +1611,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_lookup_does_not_create_a_lookup_series() {
+    fn missing_worker_reports_export_zero_reused_tokens() {
         let registry = dynamo_runtime::MetricsRegistry::new();
         let metrics = RouterRequestMetrics::for_test(&registry);
-        metrics.observe_kv_worker_hit(
-            RequestPhase::Aggregated,
-            "m",
-            WorkerReport::LookupUnavailable(85),
-        );
-        let output = registry.prometheus_expfmt_combined().unwrap();
-        assert!(!output.contains("kv_worker_lookup_tokens"), "{output}");
-        assert!(
-            output.contains("kv_worker_reused_tokens_total{model=\"m\",phase=\"aggregated\"} 85"),
-            "{output}"
-        );
-        assert!(
-            output.contains("result=\"lookup_unavailable\"} 1"),
-            "{output}"
-        );
-        metrics.observe_kv_worker_hit(
-            RequestPhase::Aggregated,
-            "zero",
-            WorkerReport::Tokens([0, 0]),
-        );
+        metrics.observe_kv_route_estimate(RequestPhase::Aggregated, "m", 96, 64);
         let output = registry.prometheus_expfmt_combined().unwrap();
         assert!(
-            output.contains("kv_worker_lookup_tokens_total{model=\"zero\",phase=\"aggregated\"} 0"),
+            output.contains("kv_worker_reused_tokens_total{model=\"m\",phase=\"aggregated\"} 0"),
             "{output}"
         );
-        assert!(output.contains("kv_worker_outcomes_total{model=\"zero\",phase=\"aggregated\",result=\"complete\"} 1"), "{output}");
     }
 
     #[test]

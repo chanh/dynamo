@@ -310,22 +310,20 @@ These counters record, per KV-routing attempt, the cached prefix estimated by th
 | Prompt tokens received | `dynamo_component_router_input_sequence_tokens_sum{phase,model}` (existing) | router, at selection |
 | Cached prefix on the best eligible worker | `dynamo_component_router_kv_best_eligible_cached_prefix_tokens_total{phase,model}` | router estimate, at selection |
 | Cached prefix on the selected worker | `dynamo_component_router_kv_selected_cached_prefix_tokens_total{phase,model}` | router estimate, at selection |
-| Prefix found by the worker's cache lookup | `dynamo_component_router_kv_worker_lookup_tokens_total{phase,model}` | worker report, at completion; no stock backend producer yet |
-| Prefix reported reused by the worker | `dynamo_component_router_kv_worker_reused_tokens_total{phase,model}` | worker report, at completion |
-| Worker report per attempt | `dynamo_component_router_kv_worker_outcomes_total{phase,model,result}` | `complete`, `lookup_unavailable`, or `incomplete` |
+| Prefix reported reused by the worker | `dynamo_component_router_kv_worker_reused_tokens_total{phase,model}` | first valid worker report received per attempt |
 
-The best-eligible and selected estimates are raw contiguous prefix overlap in tokens across device, host-pinned, and disk/external tiers; the router's tier weights affect worker selection only. Worker tokens require a successfully completed stream and a valid report with matching prompt length. Lookup is local hits plus external matched-prefix tokens; reused is the backend's reported cache-hit total. Values are uncapped.
+The best-eligible and selected estimates are raw contiguous prefix overlap in tokens across device, host-pinned, and disk/external tiers; the router's tier weights affect worker selection only. Reused tokens are the backend's reported cache-hit total, counted once when a valid report with matching routing prompt length arrives. Values are uncapped.
 
-When the external lookup count is unavailable, only reused tokens are recorded, with `result="lookup_unavailable"`. No lookup value is substituted or recorded as zero. Missing, invalid, overflowing, or unsuccessfully completed reports record `result="incomplete"` without worker tokens. A zero hit with a valid lookup report is `complete`, not missing data.
+Missing or invalid reports contribute zero reused tokens. The reused-token series is initialized to zero when routing starts, including for workers that do not report reuse. A later cancellation or stream error does not undo a report already counted. These metrics rely on accurate backend reporting; they do not measure lookup counts or per-tier reuse.
 
 - **Pools and phases:** prefill and decode attempts in one router process share a `router_id`. Compare within the same `phase` and `model`; summing phases counts separate attempts, not logical requests.
 - **Retries:** migrations add attempts to the same series. Received tokens on a retry include already-generated tokens.
 - **Compatibility:** `router_input_sequence_tokens` now excludes query-only lookups and adds `phase` and `model` labels. Existing queries requiring process-wide totals must sum across these labels. The input histogram still includes non-KV routing; compare it with KV estimates only for matching KV-routing traffic.
 - **`router_kv_hit_rate`:** this is a tier-weighted block ratio, not the raw selected-prefix token ratio.
-- **Backend coverage:** only vLLM emits the worker report. SGLang and TensorRT-LLM KV attempts record router estimates and an `incomplete` outcome. The vLLM adapter reads the aggregate `RequestOutput.num_cached_tokens`; it does not report a local/external breakdown or a lookup count. Valid vLLM reports therefore record `lookup_unavailable`, and no stock backend currently populates the lookup series. Backend cached-token counts may retain initial matches after a failed transfer; they are not independently verified successful reuse. Do not interpret a lookup-to-reuse gap as transfer loss without backend failure-accounting support.
+- **Backend coverage:** vLLM emits the aggregate `RequestOutput.num_cached_tokens` from both generation and dedicated prefill workers. SGLang and TensorRT-LLM record router estimates but contribute zero reported reuse. Backend counts may retain initial matches after a failed transfer; this metric records reported reuse, not independently verified successful reuse.
 - **Multimodal:** estimates use routing tokens while received tokens use input token IDs; differences are not necessarily cache misses.
 
-Metrics are recorded at different times: router estimates at selection and worker reports at completion. Short time windows can therefore contain different request populations. Use the outcome counter to check reporting coverage before comparing worker token totals.
+Metrics are recorded at different times: router estimates at selection and worker counts when their reports arrive. Short time windows can therefore contain different request populations.
 
 `dynamo_frontend_cached_tokens` is unchanged: it counts logical frontend requests, falls back to the router estimate when matching backend usage is unavailable, and cannot replace the per-attempt worker series under migration or disaggregated routing.
 

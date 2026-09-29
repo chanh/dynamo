@@ -701,11 +701,7 @@ async fn terminal_item_does_not_skip_transport_eof() {
 struct KvHitSnapshot {
     best: u64,
     selected: u64,
-    lookup: u64,
     reused: u64,
-    complete: u64,
-    incomplete: u64,
-    lookup_unavailable: u64,
 }
 
 fn kv_hit_snapshot(metrics: &crate::kv_router::metrics::RouterRequestMetrics) -> KvHitSnapshot {
@@ -716,20 +712,7 @@ fn kv_hit_snapshot(metrics: &crate::kv_router::metrics::RouterRequestMetrics) ->
     KvHitSnapshot {
         best: counter(&metrics.kv_best_eligible_cached_prefix_tokens),
         selected: counter(&metrics.kv_selected_cached_prefix_tokens),
-        lookup: counter(&metrics.kv_worker_lookup_tokens),
         reused: counter(&metrics.kv_worker_reused_tokens),
-        complete: metrics
-            .kv_worker_outcomes_total
-            .with_label_values(&[phase, model, "complete"])
-            .get(),
-        incomplete: metrics
-            .kv_worker_outcomes_total
-            .with_label_values(&[phase, model, "incomplete"])
-            .get(),
-        lookup_unavailable: metrics
-            .kv_worker_outcomes_total
-            .with_label_values(&[phase, model, "lookup_unavailable"])
-            .get(),
     }
 }
 
@@ -781,28 +764,21 @@ async fn kv_cache_hit_complete_attempt_records_every_stage_once() {
         finish_reason: Some(FinishReason::Stop),
         engine_data: Some(serde_json::json!({
             "kv_cache_hit": {
-                "complete": true,
                 "prompt_tokens": 100,
-                "local_hit_tokens": 70,
-                "external_hit_tokens": 15,
-                "external_lookup_tokens": 20,
+                "reused_tokens": 85,
             }
         })),
         ..Default::default()
     })
     .await;
-    // Router estimates at selection, worker tokens at completion, each exactly once across finish + Drop.
     assert_eq!(after.best - before.best, 75);
     assert_eq!(after.selected - before.selected, 60);
-    assert_eq!(after.lookup - before.lookup, 90);
     assert_eq!(after.reused - before.reused, 85);
-    assert_eq!(after.complete - before.complete, 1);
-    assert_eq!(after.incomplete - before.incomplete, 0);
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn kv_cache_hit_attempt_without_worker_report_is_incomplete_once() {
+async fn kv_cache_hit_attempt_without_worker_report_contributes_zero() {
     let (before, after) = run_kv_hit_attempt(LLMEngineOutput {
         finish_reason: Some(FinishReason::Stop),
         ..Default::default()
@@ -810,24 +786,18 @@ async fn kv_cache_hit_attempt_without_worker_report_is_incomplete_once() {
     .await;
     assert_eq!(after.best - before.best, 75);
     assert_eq!(after.selected - before.selected, 60);
-    assert_eq!(after.lookup - before.lookup, 0);
     assert_eq!(after.reused - before.reused, 0);
-    assert_eq!(after.complete - before.complete, 0);
-    assert_eq!(after.incomplete - before.incomplete, 1);
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn kv_cache_hit_cancelled_attempt_discards_valid_report() {
+async fn kv_cache_hit_cancelled_attempt_keeps_reported_reuse() {
     let (before, after) = run_kv_hit_attempt(LLMEngineOutput {
         finish_reason: Some(FinishReason::Cancelled),
         engine_data: Some(serde_json::json!({
             "kv_cache_hit": {
-                "complete": true,
                 "prompt_tokens": 100,
-                "local_hit_tokens": 70,
-                "external_hit_tokens": 15,
-                "external_lookup_tokens": 20,
+                "reused_tokens": 85,
             }
         })),
         ..Default::default()
@@ -835,10 +805,7 @@ async fn kv_cache_hit_cancelled_attempt_discards_valid_report() {
     .await;
     assert_eq!(after.best - before.best, 75);
     assert_eq!(after.selected - before.selected, 60);
-    assert_eq!(after.lookup - before.lookup, 0);
-    assert_eq!(after.reused - before.reused, 0);
-    assert_eq!(after.complete - before.complete, 0);
-    assert_eq!(after.incomplete - before.incomplete, 1);
+    assert_eq!(after.reused - before.reused, 85);
 }
 
 fn cancelled_frame() -> Annotated<LLMEngineOutput> {
@@ -848,9 +815,12 @@ fn cancelled_frame() -> Annotated<LLMEngineOutput> {
     })
 }
 
+#[rstest::rstest]
+#[case(0)]
+#[case(1)]
 #[tokio::test]
 #[serial_test::serial]
-async fn kv_cache_hit_completion_keeps_selection_phase() {
+async fn kv_cache_hit_counts_immediately_once_in_selection_phase(#[case] reused: u64) {
     let (router, runtime) = router(None).await;
     let metrics = crate::kv_router::metrics::RouterRequestMetrics::for_test(
         &dynamo_runtime::MetricsRegistry::new(),
@@ -880,20 +850,34 @@ async fn kv_cache_hit_completion_keeps_selection_phase() {
     guard
         .on_item(&Annotated::from_data(LLMEngineOutput {
             engine_data: Some(serde_json::json!({"kv_cache_hit": {
-                "complete": true, "prompt_tokens": 1, "local_hit_tokens": 1,
-                "external_hit_tokens": 0, "external_lookup_tokens": 0
+                "prompt_tokens": 1, "reused_tokens": reused
             }})),
             ..Default::default()
         }))
         .await;
-    guard.finish().await;
+    assert_eq!(
+        metrics
+            .kv_worker_reused_tokens
+            .with_label_values(&["prefill", "test"])
+            .get(),
+        reused
+    );
+    guard
+        .on_item(&Annotated::from_data(LLMEngineOutput {
+            engine_data: Some(serde_json::json!({"kv_cache_hit": {
+                "prompt_tokens": 1, "reused_tokens": 9
+            }})),
+            ..Default::default()
+        }))
+        .await;
+    guard.abort().await;
     drop(guard);
     assert_eq!(
         metrics
             .kv_worker_reused_tokens
             .with_label_values(&["prefill", "test"])
             .get(),
-        1
+        reused
     );
     assert_eq!(
         metrics
@@ -908,16 +892,13 @@ async fn kv_cache_hit_completion_keeps_selection_phase() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn kv_cache_hit_without_lookup_records_only_reuse_once() {
+async fn kv_cache_hit_ignores_missing_or_mismatched_report_fields() {
     let (before, after) = run_kv_hit_attempt(LLMEngineOutput {
         finish_reason: Some(FinishReason::Stop),
         engine_data: Some(serde_json::json!({
             "kv_cache_hit": {
-                "complete": true,
-                "prompt_tokens": 100,
-                "local_hit_tokens": 70,
-                "external_hit_tokens": 15,
-                "external_lookup_tokens": null,
+                "prompt_tokens": 99,
+                "reused_tokens": 85,
             }
         })),
         ..Default::default()
@@ -925,11 +906,7 @@ async fn kv_cache_hit_without_lookup_records_only_reuse_once() {
     .await;
     assert_eq!(after.best - before.best, 75);
     assert_eq!(after.selected - before.selected, 60);
-    assert_eq!(after.lookup - before.lookup, 0);
-    assert_eq!(after.reused - before.reused, 85);
-    assert_eq!(after.lookup_unavailable - before.lookup_unavailable, 1);
-    assert_eq!(after.complete - before.complete, 0);
-    assert_eq!(after.incomplete - before.incomplete, 0);
+    assert_eq!(after.reused - before.reused, 0);
 }
 
 fn engine_shutdown_frame() -> Annotated<LLMEngineOutput> {

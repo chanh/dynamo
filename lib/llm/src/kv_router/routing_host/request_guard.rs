@@ -5,11 +5,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     kv_router::{
-        KvRouter,
-        indexer::ApproximateRequestLease,
-        metrics::{RouterRequestMetrics, WorkerReport},
-        prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION,
-        request_lease::RequestAttemptLease,
+        KvRouter, indexer::ApproximateRequestLease, metrics::RouterRequestMetrics,
+        prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION, request_lease::RequestAttemptLease,
     },
     lora::LoadEstimator,
     preprocessor::PreprocessedRequest,
@@ -82,58 +79,25 @@ pub(super) struct RouteObservation {
 }
 
 struct KvHitTracking {
-    route: RouteObservation,
+    prompt_tokens: u64,
     model: String,
     phase: RequestPhase,
-    report: Option<WorkerReport>,
     recorded: bool,
 }
 
 /// Cache-hit report the worker attaches to its final chunk (`engine_data.kv_cache_hit`).
 #[derive(serde::Deserialize)]
 struct WorkerCacheHitReport {
-    complete: bool,
-    #[serde(default)]
     prompt_tokens: u64,
-    #[serde(default)]
-    local_hit_tokens: u64,
-    #[serde(default)]
-    external_hit_tokens: u64,
-    #[serde(default)]
-    external_lookup_tokens: Option<u64>,
+    reused_tokens: u64,
 }
 
-/// `None` when the report is not usable (incomplete, or describes a different prompt
-/// length); otherwise the latched report.
-fn worker_cache_hit_tokens(
-    route: RouteObservation,
-    value: &serde_json::Value,
-) -> Option<WorkerReport> {
+fn worker_cache_hit_tokens(prompt_tokens: u64, value: &serde_json::Value) -> Option<u64> {
     let report = <WorkerCacheHitReport as serde::Deserialize>::deserialize(value).ok()?;
-    if !report.complete || report.prompt_tokens != route.prompt_tokens {
+    if report.prompt_tokens != prompt_tokens {
         return None;
     }
-    let reused = report
-        .local_hit_tokens
-        .checked_add(report.external_hit_tokens);
-    let Some(external_lookup) = report.external_lookup_tokens else {
-        return Some(reused.map_or(WorkerReport::Overflowed, WorkerReport::LookupUnavailable));
-    };
-    let lookup = report.local_hit_tokens.checked_add(external_lookup);
-    Some(match lookup.zip(reused) {
-        Some((lookup, reused)) => WorkerReport::Tokens([lookup, reused]),
-        None => WorkerReport::Overflowed,
-    })
-}
-
-/// The worker-side emission for an attempt: the latched tokens only if the stream completed.
-fn kv_worker_hit_for(stream_completed: bool, report: Option<WorkerReport>) -> Option<WorkerReport> {
-    match report {
-        Some(WorkerReport::Tokens(_) | WorkerReport::LookupUnavailable(_)) if stream_completed => {
-            report
-        }
-        _ => None,
-    }
+    Some(report.reused_tokens)
 }
 
 pub(crate) fn prompt_private_blocks(
@@ -696,8 +660,7 @@ impl RequestGuard {
             prefill_marked: false,
             migration_state: request.migration_state.clone(),
             kv_hit: kv_route.map(|route| KvHitTracking {
-                route,
-                report: None,
+                prompt_tokens: route.prompt_tokens,
                 recorded: false,
                 model: request.model.clone(),
                 phase,
@@ -894,7 +857,6 @@ impl RequestGuard {
             lifecycle.complete();
         }
         // Metrics must observe the completed request before cleanup releases its state.
-        self.record_kv_worker_outcome(true);
         self.observability
             .record_metrics(self.record_itl_at_completion);
         self.cleanup.finish().await;
@@ -921,48 +883,34 @@ impl RequestGuard {
         if let Some(lifecycle) = self.cleanup.request_lifecycle_mut() {
             lifecycle.abort(error.map(crate::protocols::common::preprocessor::owned_abort_error));
         }
-        self.record_kv_worker_outcome(false);
         self.cleanup.finish().await;
     }
 
-    /// Latch the first valid worker cache-hit report for this attempt.
+    /// Count a worker report once, even if the stream subsequently fails or is cancelled.
     fn capture_kv_worker_hit(&mut self, item: &Annotated<LLMEngineOutput>) {
         let Some(kv) = self.kv_hit.as_mut() else {
             return;
         };
-        if kv.recorded || kv.report.is_some() {
+        if kv.recorded {
             return;
         }
-        kv.report = item
+        let reused = item
             .data
             .as_ref()
             .and_then(|data| data.engine_data.as_ref())
             .and_then(|data| data.get("kv_cache_hit"))
-            .and_then(|value| worker_cache_hit_tokens(kv.route, value));
-    }
-
-    /// Emit the worker-side series once per tracked attempt: lookup/reused tokens plus a
-    /// complete outcome when the stream finished with a valid report, otherwise incomplete.
-    fn record_kv_worker_outcome(&mut self, stream_completed: bool) {
-        let Some(kv) = self.kv_hit.as_mut() else {
-            return;
-        };
-        if std::mem::replace(&mut kv.recorded, true) {
-            return;
-        }
-        let hit = kv_worker_hit_for(stream_completed, kv.report.take());
-        let phase = kv.phase;
-        let metrics = self.observability.request_metrics();
-        match hit {
-            Some(tokens) => metrics.observe_kv_worker_hit(phase, &kv.model, tokens),
-            None => metrics.observe_kv_worker_incomplete(phase, &kv.model),
+            .and_then(|value| worker_cache_hit_tokens(kv.prompt_tokens, value));
+        if let Some(reused) = reused {
+            self.observability
+                .request_metrics()
+                .observe_kv_worker_hit(kv.phase, &kv.model, reused);
+            kv.recorded = true;
         }
     }
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.record_kv_worker_outcome(false);
         self.observability
             .record_metrics(self.record_itl_at_completion);
         // RequestCleanup drops immediately afterward and performs resource cleanup.
@@ -973,73 +921,40 @@ impl Drop for RequestGuard {
 mod kv_cache_hit_tests {
     use super::*;
 
-    fn route() -> RouteObservation {
-        RouteObservation {
-            prompt_tokens: 100,
-            best_router_tokens: 75,
-            selected_router_tokens: 60,
-        }
-    }
-
-    fn report(local_hit: u64, external_hit: u64, external_lookup: u64) -> serde_json::Value {
+    fn report(reused: u64) -> serde_json::Value {
         serde_json::json!({
-            "complete": true,
             "prompt_tokens": 100,
-            "local_hit_tokens": local_hit,
-            "external_hit_tokens": external_hit,
-            "external_lookup_tokens": external_lookup,
+            "reused_tokens": reused,
         })
     }
 
     #[test]
     fn worker_values_may_exceed_router_estimate_and_prompt_length() {
-        assert_eq!(
-            worker_cache_hit_tokens(route(), &report(120, 15, 20)),
-            Some(WorkerReport::Tokens([140, 135]))
-        );
+        assert_eq!(worker_cache_hit_tokens(100, &report(135)), Some(135));
     }
 
     #[test]
-    fn incomplete_or_mismatched_reports_are_rejected() {
-        assert_eq!(
-            worker_cache_hit_tokens(route(), &serde_json::json!({"complete": false})),
-            None
-        );
-        let mut mismatched = report(70, 15, 20);
-        mismatched["prompt_tokens"] = 99.into();
-        assert_eq!(worker_cache_hit_tokens(route(), &mismatched), None);
+    fn missing_invalid_or_mismatched_reports_are_rejected() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"prompt_tokens": 100}),
+            serde_json::json!({"prompt_tokens": 99, "reused_tokens": 70}),
+            serde_json::json!({"prompt_tokens": 100, "reused_tokens": -1}),
+            serde_json::json!({"prompt_tokens": 100, "reused_tokens": null}),
+        ] {
+            assert_eq!(worker_cache_hit_tokens(100, &value), None);
+        }
     }
 
     #[test]
-    fn counter_overflow_marks_the_observation_incomplete() {
-        let overflowing = report(u64::MAX, 0, 1);
+    fn zero_reports_and_additive_extensions_are_accepted() {
+        let mut value = report(0);
+        value["tiers"] = serde_json::json!({"device": 0});
+        value["lookup_tokens"] = 0.into();
+        assert_eq!(worker_cache_hit_tokens(100, &value), Some(0));
         assert_eq!(
-            worker_cache_hit_tokens(route(), &overflowing),
-            Some(WorkerReport::Overflowed)
-        );
-        assert_eq!(
-            kv_worker_hit_for(true, Some(WorkerReport::Overflowed)),
-            None
-        );
-    }
-
-    #[test]
-    fn missing_lookup_is_not_a_zero_or_a_reuse_estimate() {
-        let mut value = report(70, 15, 20);
-        value["external_lookup_tokens"] = serde_json::Value::Null;
-        let parsed = worker_cache_hit_tokens(route(), &value);
-        assert_eq!(parsed, Some(WorkerReport::LookupUnavailable(85)));
-        assert_eq!(kv_worker_hit_for(true, parsed), parsed);
-        assert_eq!(kv_worker_hit_for(false, parsed), None);
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("external_lookup_tokens");
-        assert_eq!(worker_cache_hit_tokens(route(), &value), parsed);
-        value["local_hit_tokens"] = u64::MAX.into();
-        assert_eq!(
-            worker_cache_hit_tokens(route(), &value),
-            Some(WorkerReport::Overflowed)
+            worker_cache_hit_tokens(100, &report(u64::MAX)),
+            Some(u64::MAX)
         );
     }
 }

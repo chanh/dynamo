@@ -3314,14 +3314,10 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         prompt_tokens = request_output.prompt_token_ids
         cached_tokens = request_output.num_cached_tokens
         if prompt_tokens is None or cached_tokens is None:
-            return {"complete": False}
-        # RequestOutput exposes only aggregate hits, not a local/external split.
+            return {}
         return {
-            "complete": True,
             "prompt_tokens": len(prompt_tokens),
-            "local_hit_tokens": cached_tokens,
-            "external_hit_tokens": 0,
-            "external_lookup_tokens": None,
+            "reused_tokens": cached_tokens,
         }
 
     @staticmethod
@@ -4323,6 +4319,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                     "completion_usage": BaseWorkerHandler._build_completion_usage(
                         request_output=res,
                     ),
+                    "engine_data": {
+                        "kv_cache_hit": BaseWorkerHandler._kv_cache_hit_engine_data(res)
+                    },
                 }
 
                 # Log prefill completion with LoRA info
