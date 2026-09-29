@@ -70,7 +70,7 @@ impl HistorySync {
                 break;
             }
             if self.sender.try_send(batch).is_err() {
-                tracing::warn!("Cache history replica queue unavailable; dropping peer update");
+                tracing::trace!("Cache history replica queue unavailable; dropping peer update");
                 break;
             }
         }
