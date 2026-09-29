@@ -303,29 +303,21 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
 
 ### KV-cache reuse telemetry
 
-These counters record, per KV-routing attempt, the cached prefix estimated by the router and the cache hits reported by the worker. They carry `phase` (`aggregated`, `prefill`, or `decode`) and `model` labels. The existing input-sequence histogram carries the same labels; use its `_sum` as the received-token denominator.
+The cache reuse funnel shows how much of the incoming prompt could be reused, and how much the worker reports reusing. Each step counts tokens, not requests.
 
-| Stage | Metric | Source |
+All metric names below start with `dynamo_component_router_`.
+
+| Step | Meaning | Metric suffix |
 | --- | --- | --- |
-| Prompt tokens received | `dynamo_component_router_input_sequence_tokens_sum{phase,model}` (existing) | router, at selection |
-| Cached prefix on the best eligible worker | `dynamo_component_router_kv_best_eligible_cached_prefix_tokens_total{phase,model}` | router estimate, at selection |
-| Cached prefix on the selected worker | `dynamo_component_router_kv_selected_cached_prefix_tokens_total{phase,model}` | router estimate, at selection |
-| Prefix reported reused by the worker | `dynamo_component_router_kv_worker_reused_tokens_total{phase,model}` | first valid worker report received per attempt |
+| **F0 — Incoming tokens** | Tokens received by the router. | `input_sequence_tokens_sum` |
+| **F1 — Previously seen prefix** | Prefix matching the router's history: potential reuse, even if no longer cached. | `kv_history_cached_prefix_tokens_total` |
+| **F2 — Best available match** | Prefix the router estimates is cached on the best-matching eligible worker. | `kv_best_eligible_cached_prefix_tokens_total` |
+| **F3 — Selected worker's match** | Prefix the router estimates is cached on the worker it chooses. | `kv_selected_cached_prefix_tokens_total` |
+| **F4 — Reported reuse** | Tokens the worker reports reusing. Missing reports count as zero. | `kv_worker_reused_tokens_total` |
 
-The best-eligible and selected estimates are raw contiguous prefix overlap in tokens across device, host-pinned, and disk/external tiers; the router's tier weights affect worker selection only. Reused tokens are the backend's reported cache-hit total, counted once when a valid report with matching routing prompt length arrives. Values are uncapped.
+F1 is added separately in [the cache reuse history PR](https://github.com/ai-dynamo/dynamo/pull/14889) and requires `DYN_ROUTER_CACHE_REUSE_HISTORY=true`. F2–F4 need no enable flag.
 
-Missing or invalid reports contribute zero reused tokens. The reused-token series is initialized to zero when routing starts, including for workers that do not report reuse. A later cancellation or stream error does not undo a report already counted. These metrics rely on accurate backend reporting; they do not measure lookup counts or per-tier reuse.
-
-- **Pools and phases:** prefill and decode attempts in one router process share a `router_id`. Compare within the same `phase` and `model`; summing phases counts separate attempts, not logical requests.
-- **Retries:** migrations add attempts to the same series. Received tokens on a retry include already-generated tokens.
-- **Compatibility:** `router_input_sequence_tokens` now excludes query-only lookups and adds `phase` and `model` labels. Existing queries requiring process-wide totals must sum across these labels. The input histogram still includes non-KV routing; compare it with KV estimates only for matching KV-routing traffic.
-- **`router_kv_hit_rate`:** this is a tier-weighted block ratio, not the raw selected-prefix token ratio.
-- **Backend coverage:** vLLM emits the aggregate `RequestOutput.num_cached_tokens` from both generation and dedicated prefill workers. SGLang and TensorRT-LLM record router estimates but contribute zero reported reuse. Backend counts may retain initial matches after a failed transfer; this metric records reported reuse, not independently verified successful reuse.
-- **Multimodal:** estimates use routing tokens while received tokens use input token IDs; differences are not necessarily cache misses.
-
-Metrics are recorded at different times: router estimates at selection and worker counts when their reports arrive. Short time windows can therefore contain different request populations.
-
-`dynamo_frontend_cached_tokens` is unchanged: it counts logical frontend requests, falls back to the router estimate when matching backend usage is unavailable, and cannot replace the per-attempt worker series under migration or disaggregated routing.
+Compare token increases over the same time window and matching KV-routing traffic. Use a long enough window: the steps are recorded at different times, and F4 depends on worker reports arriving after routing. Short windows may therefore compare different requests. Divide each step by F0 to express it as a percentage of incoming tokens.
 
 ### Per-request routing overhead
 
